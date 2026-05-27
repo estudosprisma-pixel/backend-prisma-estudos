@@ -6,7 +6,7 @@ const addDaysISO = (days) => {
   return toISODate(date);
 };
 const daysAgo = (days) => addDaysISO(-days);
-const editalCatalog = require("../catalog");
+const editalCatalog = require("./catalog");
 const defaultContestIds = editalCatalog.contests.map((contest) => contest.id);
 const analystContest = editalCatalog.contests.find((contest) => contest.id === "analista-judiciario-area-administrativa");
 const technicianContest = editalCatalog.contests.find((contest) => contest.id === "tecnico-judiciario-area-administrativa");
@@ -14,9 +14,9 @@ const technicianContest = editalCatalog.contests.find((contest) => contest.id ==
 const seedState = {
   currentUserId: null,
   users: [
-    { id: "u-admin", name: "Marina Admin", email: "admin@studyflow.local", password: "admin123", role: "admin", status: "active", accessExpiresAt: null },
-    { id: "u-ana", name: "Ana Ribeiro", email: "ana@studyflow.local", password: "123456", role: "student", status: "active", accessExpiresAt: addDaysISO(30) },
-    { id: "u-lucas", name: "Lucas Lima", email: "lucas@studyflow.local", password: "123456", role: "student", status: "active", accessExpiresAt: addDaysISO(7) }
+    { id: "u-admin", name: "Marina Admin", email: "admin@prismaestudos.local", password: "admin123", role: "admin", status: "active", accessExpiresAt: null },
+    { id: "u-ana", name: "Ana Ribeiro", email: "ana@prismaestudos.local", password: "123456", role: "student", status: "active", accessExpiresAt: addDaysISO(30) },
+    { id: "u-lucas", name: "Lucas Lima", email: "lucas@prismaestudos.local", password: "123456", role: "student", status: "active", accessExpiresAt: addDaysISO(7) }
   ],
   contests: [...editalCatalog.contests],
   profiles: {
@@ -53,24 +53,24 @@ const seedState = {
   },
   subjects: [
     ...editalCatalog.subjects,
-    { id: "s-mat", name: "Matematica", color: "#25d4c8", isBase: true, ownerId: null },
-    { id: "s-por", name: "Portugues", color: "#f0a84a", isBase: true, ownerId: null },
+    { id: "s-mat", name: "Matemática", color: "#22d3ee", isBase: true, ownerId: null },
+    { id: "s-por", name: "Português", color: "#8b5cf6", isBase: true, ownerId: null },
     { id: "s-dir", name: "Direito Constitucional", color: "#69a7ff", isBase: true, ownerId: null },
-    { id: "s-his", name: "Historia", color: "#45d483", isBase: true, ownerId: null },
-    { id: "s-ana-red", name: "Redacao Estrategica", color: "#ff7a90", isBase: false, ownerId: "u-ana" }
+    { id: "s-his", name: "História", color: "#38bdf8", isBase: true, ownerId: null },
+    { id: "s-ana-red", name: "Redação Estratégica", color: "#ff7a90", isBase: false, ownerId: "u-ana" }
   ],
   topics: [
     ...editalCatalog.topics,
-    { id: "t-mat-1", subjectId: "s-mat", title: "Razao e proporcao", order: 1, suggestedMinutes: 45, isBase: true, ownerId: null },
+    { id: "t-mat-1", subjectId: "s-mat", title: "Razão e proporção", order: 1, suggestedMinutes: 45, isBase: true, ownerId: null },
     { id: "t-mat-2", subjectId: "s-mat", title: "Porcentagem aplicada", order: 2, suggestedMinutes: 50, isBase: true, ownerId: null },
-    { id: "t-mat-3", subjectId: "s-mat", title: "Equacoes do primeiro grau", order: 3, suggestedMinutes: 55, isBase: true, ownerId: null },
-    { id: "t-por-1", subjectId: "s-por", title: "Interpretacao de texto", order: 1, suggestedMinutes: 40, isBase: true, ownerId: null },
+    { id: "t-mat-3", subjectId: "s-mat", title: "Equações do primeiro grau", order: 3, suggestedMinutes: 55, isBase: true, ownerId: null },
+    { id: "t-por-1", subjectId: "s-por", title: "Interpretação de texto", order: 1, suggestedMinutes: 40, isBase: true, ownerId: null },
     { id: "t-por-2", subjectId: "s-por", title: "Classes de palavras", order: 2, suggestedMinutes: 45, isBase: true, ownerId: null },
-    { id: "t-por-3", subjectId: "s-por", title: "Pontuacao", order: 3, suggestedMinutes: 35, isBase: true, ownerId: null },
-    { id: "t-dir-1", subjectId: "s-dir", title: "Principios fundamentais", order: 1, suggestedMinutes: 50, isBase: true, ownerId: null },
+    { id: "t-por-3", subjectId: "s-por", title: "Pontuação", order: 3, suggestedMinutes: 35, isBase: true, ownerId: null },
+    { id: "t-dir-1", subjectId: "s-dir", title: "Princípios fundamentais", order: 1, suggestedMinutes: 50, isBase: true, ownerId: null },
     { id: "t-dir-2", subjectId: "s-dir", title: "Direitos e garantias fundamentais", order: 2, suggestedMinutes: 60, isBase: true, ownerId: null },
-    { id: "t-his-1", subjectId: "s-his", title: "Brasil Colonia", order: 1, suggestedMinutes: 45, isBase: true, ownerId: null },
-    { id: "t-red-1", subjectId: "s-ana-red", title: "Estrutura da dissertacao", order: 1, suggestedMinutes: 40, isBase: false, ownerId: "u-ana" }
+    { id: "t-his-1", subjectId: "s-his", title: "Brasil Colônia", order: 1, suggestedMinutes: 45, isBase: true, ownerId: null },
+    { id: "t-red-1", subjectId: "s-ana-red", title: "Estrutura da dissertação", order: 1, suggestedMinutes: 40, isBase: false, ownerId: "u-ana" }
   ],
   userSubjects: {
     "u-ana": [...(analystContest?.subjects || []), "s-ana-red"],
@@ -97,7 +97,8 @@ const seedState = {
     { id: "r-1", userId: "u-ana", subjectId: "s-mat", topicId: "t-mat-1", originalDate: daysAgo(5), dueDate: toISODate(today), count: 1, status: "pendente" }
   ],
   themes: {
-    "u-ana": { mode: "dark", primary: "#25d4c8", secondary: "#f0a84a", cardStyle: "soft", banner: "assets/studyflow-banner.png", density: "normal" }
+    "u-ana": { mode: "dark", primary: "#22d3ee", secondary: "#8b5cf6", cardStyle: "soft", banner: "assets/prisma-estudos-logo.png", density: "normal" },
+    "u-lucas": { mode: "dark", primary: "#38bdf8", secondary: "#6366f1", cardStyle: "solid", banner: "assets/prisma-estudos-logo.png", density: "compact" }
   },
   route: "dashboard"
 };

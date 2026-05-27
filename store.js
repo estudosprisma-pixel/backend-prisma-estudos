@@ -11,7 +11,7 @@ async function readStateFromDb() {
   const [userTopics] = await pool.query("SELECT * FROM user_topics");
   const [sessions] = await pool.query("SELECT * FROM study_sessions ORDER BY started_at, id");
   const [reviews] = await pool.query("SELECT * FROM reviews ORDER BY due_date, id");
-  const [themes] = await pool.query("SELECT * FROM user_theme_settings");
+  const themes = await readOptionalTable("user_theme_settings", "SELECT * FROM user_theme_settings");
 
   const state = {
     currentUserId: null,
@@ -128,7 +128,8 @@ async function saveStateToDb(state) {
     await connection.query("DELETE FROM study_sessions");
     await connection.query("DELETE FROM user_topics");
     await connection.query("DELETE FROM user_subjects");
-    await connection.query("DELETE FROM user_theme_settings");
+    const hasThemeSettings = await tableExists(connection, "user_theme_settings");
+    if (hasThemeSettings) await connection.query("DELETE FROM user_theme_settings");
     await connection.query("DELETE FROM study_profiles");
     await connection.query("DELETE FROM topics");
     await connection.query("DELETE FROM subjects");
@@ -149,7 +150,7 @@ async function saveStateToDb(state) {
       await connection.query(
         `INSERT INTO subjects (id, name, color, is_base, owner_user_id, created_by_admin_id)
          VALUES (?, ?, ?, ?, ?, ?)`,
-        [subject.id, subject.name, subject.color || "#25d4c8", bool(subject.isBase), subject.ownerId || null, subject.isBase ? state.currentUserId || null : null]
+        [subject.id, subject.name, subject.color || "#22d3ee", bool(subject.isBase), subject.ownerId || null, subject.isBase ? state.currentUserId || null : null]
       );
     }
 
@@ -240,21 +241,23 @@ async function saveStateToDb(state) {
       );
     }
 
-    for (const [userId, theme] of Object.entries(state.themes || {})) {
-      await connection.query(
-        `INSERT INTO user_theme_settings
-          (user_id, theme_mode, primary_color, secondary_color, card_style, banner_url, density)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [
-          userId,
-          theme.mode || "dark",
-          theme.primary || "#25d4c8",
-          theme.secondary || "#f0a84a",
-          theme.cardStyle || "soft",
-          theme.banner || null,
-          theme.density || "normal"
-        ]
-      );
+    if (hasThemeSettings) {
+      for (const [userId, theme] of Object.entries(state.themes || {})) {
+        await connection.query(
+          `INSERT INTO user_theme_settings
+            (user_id, theme_mode, primary_color, secondary_color, card_style, banner_url, density)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            userId,
+            theme.mode || "dark",
+            theme.primary || "#22d3ee",
+            theme.secondary || "#8b5cf6",
+            theme.cardStyle || "soft",
+            theme.banner || null,
+            theme.density || "normal"
+          ]
+        );
+      }
     }
 
     await connection.commit();
@@ -269,6 +272,17 @@ async function saveStateToDb(state) {
 async function hasUsers() {
   const [[row]] = await pool.query("SELECT COUNT(*) AS total FROM users");
   return row.total > 0;
+}
+
+async function readOptionalTable(tableName, query) {
+  if (!(await tableExists(pool, tableName))) return [];
+  const [rows] = await pool.query(query);
+  return rows;
+}
+
+async function tableExists(executor, tableName) {
+  const [rows] = await executor.query("SHOW TABLES LIKE ?", [tableName]);
+  return rows.length > 0;
 }
 
 function parseJson(value, fallback) {

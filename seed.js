@@ -6,6 +6,10 @@ const { saveStateToDb } = require("./store");
 
 saveStateToDb(seedState)
   .then(() => {
-    console.log("Seed do StudyFlow concluido.");
+    console.log("Seed do Prisma Estudos concluido.");
+  })
+  .catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
   })
   .finally(() => pool.end());

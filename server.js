@@ -5,13 +5,18 @@ const bcrypt = require("bcryptjs");
 const cors = require("cors");
 const express = require("express");
 const jwt = require("jsonwebtoken");
-const { pool } = require("./db");
+const { dbConfig, pool } = require("./db");
 const { hasUsers, readStateFromDb, saveStateToDb } = require("./store");
 const { seedState } = require("./seedData");
 
 const app = express();
 const port = Number(process.env.PORT || 3001);
 const jwtSecret = process.env.JWT_SECRET || "dev-only-change-me";
+const isProduction = process.env.NODE_ENV === "production";
+
+if (isProduction && jwtSecret === "dev-only-change-me") {
+  throw new Error("JWT_SECRET precisa ser configurado em producao.");
+}
 
 app.use(cors({
   origin(origin, callback) {
@@ -21,12 +26,17 @@ app.use(cors({
   }
 }));
 app.use(express.json({ limit: "3mb" }));
-app.use("/fotos editais", express.static(path.join(__dirname, "..", "..", "fotos editais")));
-app.use(express.static(path.join(__dirname, "..")));
+app.use("/assets", express.static(path.join(__dirname, "assets")));
+app.use("/fotos editais", express.static(path.join(__dirname, "assets", "fotos editais")));
 
 app.get("/api/health", async (_req, res) => {
   await pool.query("SELECT 1");
-  res.json({ ok: true, database: process.env.DB_NAME });
+  res.json({
+    ok: true,
+    service: "Prisma Estudos API",
+    database: dbConfig.database,
+    environment: process.env.NODE_ENV || "development"
+  });
 });
 
 app.post("/api/auth/login", async (req, res) => {
@@ -74,7 +84,7 @@ app.post("/api/dev/seed", async (_req, res) => {
 
 app.use((error, _req, res, _next) => {
   console.error(error);
-  res.status(500).json({ message: "Erro interno no StudyFlow.", detail: process.env.NODE_ENV === "production" ? undefined : error.message });
+  res.status(500).json({ message: "Erro interno no Prisma Estudos.", detail: isProduction ? undefined : error.message });
 });
 
 async function requireAuth(req, res, next) {
@@ -180,10 +190,11 @@ function pickKey(source, key) {
 
 async function start() {
   if (process.env.AUTO_SEED === "true" && !(await hasUsers())) {
+    console.log("AUTO_SEED ativo e tabela users vazia. Criando dados iniciais do Prisma Estudos...");
     await saveStateToDb(seedState);
   }
   app.listen(port, () => {
-    console.log(`StudyFlow backend rodando em http://localhost:${port}`);
+    console.log(`Prisma Estudos API rodando na porta ${port}`);
   });
 }
 

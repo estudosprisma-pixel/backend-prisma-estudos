@@ -3,7 +3,7 @@ const { pool } = require("./db");
 const { bool, dateOnly, dateTimeFor, fromDbStatus, toDbStatus } = require("./stateMapper");
 
 async function readStateFromDb() {
-  const [users] = await pool.query("SELECT id, name, email, role, status FROM users ORDER BY created_at, id");
+  const [users] = await pool.query("SELECT id, name, email, role, status, access_expires_at FROM users ORDER BY created_at, id");
   const [profiles] = await pool.query("SELECT * FROM study_profiles");
   const [subjects] = await pool.query("SELECT * FROM subjects ORDER BY created_at, id");
   const [topics] = await pool.query("SELECT * FROM topics ORDER BY topic_order, id");
@@ -20,7 +20,8 @@ async function readStateFromDb() {
       name: user.name,
       email: user.email,
       role: user.role,
-      status: user.status
+      status: user.status,
+      accessExpiresAt: dateOnly(user.access_expires_at)
     })),
     profiles: {},
     subjects: subjects.map((subject) => ({
@@ -77,7 +78,9 @@ async function readStateFromDb() {
       level: profile.current_level,
       reviewPreference: profile.review_preference,
       topicsPerDay: profile.topics_per_day,
-      mixSubjects: Boolean(profile.mix_subjects)
+      mixSubjects: Boolean(profile.mix_subjects),
+      configured: Boolean(profile.profile_configured),
+      onboardingCompleted: Boolean(profile.onboarding_completed)
     };
   });
 
@@ -136,9 +139,9 @@ async function saveStateToDb(state) {
         ? await bcrypt.hash(user.password, 10)
         : passwordHashes.get(user.id) || await bcrypt.hash("123456", 10);
       await connection.query(
-        `INSERT INTO users (id, name, email, password_hash, role, status)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [user.id, user.name, user.email, passwordHash, user.role || "student", user.status || "active"]
+        `INSERT INTO users (id, name, email, password_hash, role, status, access_expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [user.id, user.name, user.email, passwordHash, user.role || "student", user.status || "active", user.accessExpiresAt || null]
       );
     }
 
@@ -162,8 +165,8 @@ async function saveStateToDb(state) {
       if (!(state.users || []).some((user) => user.id === userId)) continue;
       await connection.query(
         `INSERT INTO study_profiles
-          (id, user_id, objective, education_context, daily_minutes, available_days, preferred_time, current_level, review_preference, topics_per_day, mix_subjects)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          (id, user_id, objective, education_context, daily_minutes, available_days, preferred_time, current_level, review_preference, topics_per_day, mix_subjects, profile_configured, onboarding_completed)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           `sp-${userId}`,
           userId,
@@ -175,7 +178,9 @@ async function saveStateToDb(state) {
           profile.level || "iniciante",
           profile.reviewPreference || "semanal",
           Number(profile.topicsPerDay || 1),
-          bool(profile.mixSubjects)
+          bool(profile.mixSubjects),
+          bool(profile.configured),
+          bool(profile.onboardingCompleted)
         ]
       );
     }

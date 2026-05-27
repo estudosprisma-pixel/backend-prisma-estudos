@@ -5,6 +5,7 @@ CREATE TABLE users (
   password_hash VARCHAR(255) NOT NULL,
   role ENUM('admin', 'student') NOT NULL DEFAULT 'student',
   status ENUM('active', 'inactive') NOT NULL DEFAULT 'active',
+  access_expires_at DATE,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -21,6 +22,8 @@ CREATE TABLE study_profiles (
   review_preference VARCHAR(40) NOT NULL,
   topics_per_day INT NOT NULL DEFAULT 1,
   mix_subjects BOOLEAN NOT NULL DEFAULT TRUE,
+  profile_configured BOOLEAN NOT NULL DEFAULT FALSE,
+  onboarding_completed BOOLEAN NOT NULL DEFAULT FALSE,
   FOREIGN KEY (user_id) REFERENCES users(id)
 );
 

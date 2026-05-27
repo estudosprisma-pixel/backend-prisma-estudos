@@ -21,6 +21,7 @@ app.use(cors({
   }
 }));
 app.use(express.json({ limit: "3mb" }));
+app.use("/fotos editais", express.static(path.join(__dirname, "..", "..", "fotos editais")));
 app.use(express.static(path.join(__dirname, "..")));
 
 app.get("/api/health", async (_req, res) => {
@@ -34,6 +35,7 @@ app.post("/api/auth/login", async (req, res) => {
 
   const [[user]] = await pool.query("SELECT * FROM users WHERE email = ? AND status = 'active' LIMIT 1", [email]);
   if (!user) return res.status(401).json({ message: "Login ou senha invalidos." });
+  if (!isAccessActive(user)) return res.status(403).json({ message: "Seu acesso expirou. Fale com o administrador para renovar." });
 
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) return res.status(401).json({ message: "Login ou senha invalidos." });
@@ -80,8 +82,9 @@ async function requireAuth(req, res, next) {
     const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
     if (!token) return res.status(401).json({ message: "Sessao expirada." });
     const payload = jwt.verify(token, jwtSecret);
-    const [[user]] = await pool.query("SELECT id, name, email, role, status FROM users WHERE id = ? AND status = 'active'", [payload.sub]);
+    const [[user]] = await pool.query("SELECT id, name, email, role, status, access_expires_at FROM users WHERE id = ? AND status = 'active'", [payload.sub]);
     if (!user) return res.status(401).json({ message: "Usuario nao encontrado." });
+    if (!isAccessActive(user)) return res.status(403).json({ message: "Acesso expirado." });
     req.user = user;
     next();
   } catch {
@@ -95,8 +98,22 @@ function publicUser(user) {
     name: user.name,
     email: user.email,
     role: user.role,
-    status: user.status
+    status: user.status,
+    accessExpiresAt: dateOnly(user.access_expires_at)
   };
+}
+
+function isAccessActive(user) {
+  if (user.role === "admin") return true;
+  const expiresAt = dateOnly(user.access_expires_at);
+  if (!expiresAt) return true;
+  return expiresAt >= new Date().toISOString().slice(0, 10);
+}
+
+function dateOnly(value) {
+  if (!value) return null;
+  if (typeof value === "string") return value.slice(0, 10);
+  return value.toISOString().slice(0, 10);
 }
 
 function filterStateForUser(state, user) {

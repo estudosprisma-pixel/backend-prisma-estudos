@@ -14,6 +14,8 @@ const technicianContest = editalCatalog.contests.find((contest) => contest.id ==
 const seedState = {
   currentUserId: null,
   users: [
+    { id: "u-admin-nat", name: "Nat", email: "nat@prismaestudos.local", passwordHash: "$2a$10$EHAVS.bdlgsqtP2.snvYhOBqysLpH6sXYR/4yw2CswXHValZNJCcu", role: "admin", status: "active", accessExpiresAt: null },
+    { id: "u-admin-joao-guilherme", name: "João Guilherme", email: "joao.guilherme@prismaestudos.local", passwordHash: "$2a$10$HV4JHhtoA1peSwCm2n0Bm.jzJ.HBq/IAUcNd6YIl0D82SXrma27mG", role: "admin", status: "active", accessExpiresAt: null },
     { id: "u-admin", name: "Marina Admin", email: "admin@prismaestudos.local", password: "admin123", role: "admin", status: "active", accessExpiresAt: null },
     { id: "u-ana", name: "Ana Ribeiro", email: "ana@prismaestudos.local", password: "123456", role: "student", status: "active", accessExpiresAt: addDaysISO(30) },
     { id: "u-lucas", name: "Lucas Lima", email: "lucas@prismaestudos.local", password: "123456", role: "student", status: "active", accessExpiresAt: addDaysISO(7) }

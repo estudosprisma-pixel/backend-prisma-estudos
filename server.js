@@ -13,6 +13,12 @@ const app = express();
 const port = Number(process.env.PORT || 3001);
 const jwtSecret = process.env.JWT_SECRET || "dev-only-change-me";
 const isProduction = process.env.NODE_ENV === "production";
+const loginAliases = {
+  nat: "nat@prismaestudos.local",
+  "joao.guilherme": "joao.guilherme@prismaestudos.local",
+  joao: "joao.guilherme@prismaestudos.local",
+  admin: "admin@prismaestudos.local"
+};
 
 if (isProduction && jwtSecret === "dev-only-change-me") {
   throw new Error("JWT_SECRET precisa ser configurado em producao.");
@@ -41,9 +47,10 @@ app.get("/api/health", async (_req, res) => {
 
 app.post("/api/auth/login", async (req, res) => {
   const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ message: "Informe email e senha." });
+  const login = normalizeLoginIdentifier(email);
+  if (!login || !password) return res.status(400).json({ message: "Informe usuario ou email e senha." });
 
-  const [[user]] = await pool.query("SELECT * FROM users WHERE email = ? AND status = 'active' LIMIT 1", [email]);
+  const [[user]] = await pool.query("SELECT * FROM users WHERE email = ? AND status = 'active' LIMIT 1", [login]);
   if (!user) return res.status(401).json({ message: "Login ou senha invalidos." });
   if (!isAccessActive(user)) return res.status(403).json({ message: "Seu acesso expirou. Fale com o administrador para renovar." });
 
@@ -124,6 +131,13 @@ function dateOnly(value) {
   if (!value) return null;
   if (typeof value === "string") return value.slice(0, 10);
   return value.toISOString().slice(0, 10);
+}
+
+function normalizeLoginIdentifier(value) {
+  const login = String(value || "").trim().toLowerCase();
+  if (!login) return "";
+  if (login.includes("@")) return login;
+  return loginAliases[login] || `${login}@prismaestudos.local`;
 }
 
 function filterStateForUser(state, user) {

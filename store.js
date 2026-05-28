@@ -138,6 +138,8 @@ async function saveStateToDb(state) {
     for (const user of state.users || []) {
       const passwordHash = user.password
         ? await bcrypt.hash(user.password, 10)
+        : user.passwordHash
+          ? user.passwordHash
         : passwordHashes.get(user.id) || await bcrypt.hash("123456", 10);
       await connection.query(
         `INSERT INTO users (id, name, email, password_hash, role, status, access_expires_at)

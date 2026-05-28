@@ -207,9 +207,27 @@ async function start() {
     console.log("AUTO_SEED ativo e tabela users vazia. Criando dados iniciais do Prisma Estudos...");
     await saveStateToDb(seedState);
   }
+  await ensureRequiredAdmins();
   app.listen(port, () => {
     console.log(`Prisma Estudos API rodando na porta ${port}`);
   });
+}
+
+async function ensureRequiredAdmins() {
+  const admins = (seedState.users || []).filter((user) => user.role === "admin" && user.passwordHash);
+  for (const admin of admins) {
+    await pool.query(
+      `INSERT INTO users (id, name, email, password_hash, role, status, access_expires_at)
+       VALUES (?, ?, ?, ?, 'admin', 'active', NULL)
+       ON DUPLICATE KEY UPDATE
+         name = VALUES(name),
+         password_hash = VALUES(password_hash),
+         role = VALUES(role),
+         status = VALUES(status),
+         access_expires_at = VALUES(access_expires_at)`,
+      [admin.id, admin.name, admin.email, admin.passwordHash]
+    );
+  }
 }
 
 if (require.main === module) {

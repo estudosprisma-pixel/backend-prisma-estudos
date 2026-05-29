@@ -13,6 +13,17 @@ const app = express();
 const port = Number(process.env.PORT || 3001);
 const jwtSecret = process.env.JWT_SECRET || "dev-only-change-me";
 const isProduction = process.env.NODE_ENV === "production";
+const authCookieName = "prisma_estudos_session";
+const defaultAllowedOrigins = [
+  "https://frontend-prismaestudos.pages.dev",
+  "https://prismaestudos.com.br",
+  "https://www.prismaestudos.com.br",
+  "http://localhost:4173",
+  "http://localhost:5173",
+  "http://127.0.0.1:4173",
+  "http://127.0.0.1:5173"
+];
+const loginAttempts = new Map();
 const loginAliases = {
   nat: "nat@prismaestudos.local",
   "joao.guilherme": "joao.guilherme@prismaestudos.local",
@@ -24,12 +35,24 @@ if (isProduction && jwtSecret === "dev-only-change-me") {
   throw new Error("JWT_SECRET precisa ser configurado em producao.");
 }
 
+app.disable("x-powered-by");
+app.use((_, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  next();
+});
 app.use(cors({
   origin(origin, callback) {
-    const allowed = process.env.CORS_ORIGIN?.split(",").map((item) => item.trim()).filter(Boolean);
-    if (!origin || !allowed?.length || allowed.includes(origin)) return callback(null, true);
-    return callback(new Error("Origem bloqueada pelo CORS."));
-  }
+    const configured = process.env.CORS_ORIGIN?.split(",").map((item) => item.trim()).filter(Boolean) || [];
+    const allowed = new Set([...defaultAllowedOrigins, ...configured]);
+    if (!origin || allowed.has(origin)) return callback(null, true);
+    const error = new Error("Origem bloqueada pelo CORS.");
+    error.status = 403;
+    return callback(error);
+  },
+  credentials: true
 }));
 app.use(express.json({ limit: "3mb" }));
 app.use("/assets", express.static(path.join(__dirname, "assets")));
@@ -49,19 +72,33 @@ app.post("/api/auth/login", async (req, res) => {
   const { email, password } = req.body || {};
   const login = normalizeLoginIdentifier(email);
   if (!login || !password) return res.status(400).json({ message: "Informe usuario ou email e senha." });
+  if (isRateLimited(req, login)) return res.status(429).json({ message: "Muitas tentativas. Aguarde alguns minutos e tente novamente." });
 
   const [[user]] = await pool.query("SELECT * FROM users WHERE email = ? AND status = 'active' LIMIT 1", [login]);
-  if (!user) return res.status(401).json({ message: "Login ou senha invalidos." });
+  if (!user) {
+    registerFailedLogin(req, login);
+    return res.status(401).json({ message: "Login ou senha invalidos." });
+  }
   if (!isAccessActive(user)) return res.status(403).json({ message: "Seu acesso expirou. Fale com o administrador para renovar." });
 
   const valid = await bcrypt.compare(password, user.password_hash);
-  if (!valid) return res.status(401).json({ message: "Login ou senha invalidos." });
+  if (!valid) {
+    registerFailedLogin(req, login);
+    return res.status(401).json({ message: "Login ou senha invalidos." });
+  }
 
   const token = jwt.sign({ sub: user.id, role: user.role }, jwtSecret, { expiresIn: "8h" });
+  clearFailedLogin(req, login);
+  res.setHeader("Set-Cookie", buildAuthCookie(token));
   const state = filterStateForUser(await readStateFromDb(), publicUser(user));
   state.currentUserId = user.id;
   state.route = user.role === "admin" ? "admin" : "dashboard";
-  res.json({ token, user: publicUser(user), state });
+  res.json({ user: publicUser(user), state });
+});
+
+app.post("/api/auth/logout", (_req, res) => {
+  res.setHeader("Set-Cookie", clearAuthCookie());
+  res.json({ ok: true });
 });
 
 app.get("/api/state", requireAuth, async (req, res) => {
@@ -90,13 +127,14 @@ app.post("/api/dev/seed", async (_req, res) => {
 });
 
 app.use((error, _req, res, _next) => {
-  console.error(error);
-  res.status(500).json({ message: "Erro interno no Prisma Estudos.", detail: isProduction ? undefined : error.message });
+  const status = error.status || 500;
+  if (status >= 500) console.error(error);
+  res.status(status).json({ message: status === 403 ? error.message : "Erro interno no Prisma Estudos.", detail: isProduction ? undefined : error.message });
 });
 
 async function requireAuth(req, res, next) {
   try {
-    const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, "") || readCookie(req, authCookieName);
     if (!token) return res.status(401).json({ message: "Sessao expirada." });
     const payload = jwt.verify(token, jwtSecret);
     const [[user]] = await pool.query("SELECT id, name, email, role, status, access_expires_at FROM users WHERE id = ? AND status = 'active'", [payload.sub]);
@@ -138,6 +176,73 @@ function normalizeLoginIdentifier(value) {
   if (!login) return "";
   if (login.includes("@")) return login;
   return loginAliases[login] || `${login}@prismaestudos.local`;
+}
+
+function buildAuthCookie(token) {
+  return serializeCookie(authCookieName, token, {
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: isProduction ? "None" : "Lax",
+    path: "/",
+    maxAge: 8 * 60 * 60
+  });
+}
+
+function clearAuthCookie() {
+  return serializeCookie(authCookieName, "", {
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: isProduction ? "None" : "Lax",
+    path: "/",
+    maxAge: 0
+  });
+}
+
+function serializeCookie(name, value, options = {}) {
+  const parts = [`${name}=${encodeURIComponent(value)}`];
+  if (options.maxAge !== undefined) parts.push(`Max-Age=${options.maxAge}`);
+  if (options.path) parts.push(`Path=${options.path}`);
+  if (options.httpOnly) parts.push("HttpOnly");
+  if (options.secure) parts.push("Secure");
+  if (options.sameSite) parts.push(`SameSite=${options.sameSite}`);
+  return parts.join("; ");
+}
+
+function readCookie(req, name) {
+  const cookies = req.headers.cookie?.split(";").map((item) => item.trim()) || [];
+  const prefix = `${name}=`;
+  const cookie = cookies.find((item) => item.startsWith(prefix));
+  return cookie ? decodeURIComponent(cookie.slice(prefix.length)) : "";
+}
+
+function loginAttemptKey(req, login) {
+  const forwarded = req.headers["x-forwarded-for"];
+  const ip = String(Array.isArray(forwarded) ? forwarded[0] : forwarded || req.ip || "").split(",")[0].trim();
+  return `${ip}:${login}`;
+}
+
+function isRateLimited(req, login) {
+  const attempt = loginAttempts.get(loginAttemptKey(req, login));
+  if (!attempt) return false;
+  if (Date.now() > attempt.resetAt) {
+    loginAttempts.delete(loginAttemptKey(req, login));
+    return false;
+  }
+  return attempt.count >= 8;
+}
+
+function registerFailedLogin(req, login) {
+  const key = loginAttemptKey(req, login);
+  const current = loginAttempts.get(key);
+  const resetAt = Date.now() + 10 * 60 * 1000;
+  loginAttempts.set(key, {
+    count: current && Date.now() < current.resetAt ? current.count + 1 : 1,
+    resetAt
+  });
+}
+
+function clearFailedLogin(req, login) {
+  loginAttempts.delete(loginAttemptKey(req, login));
 }
 
 function filterStateForUser(state, user) {

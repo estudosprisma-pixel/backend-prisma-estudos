@@ -1,4 +1,5 @@
 const bcrypt = require("bcryptjs");
+const crypto = require("crypto");
 const { pool } = require("./db");
 const { bool, dateOnly, dateTimeFor, fromDbStatus, toDbStatus } = require("./stateMapper");
 
@@ -140,7 +141,7 @@ async function saveStateToDb(state) {
         ? await bcrypt.hash(user.password, 10)
         : user.passwordHash
           ? user.passwordHash
-        : passwordHashes.get(user.id) || await bcrypt.hash("123456", 10);
+        : passwordHashes.get(user.id) || await bcrypt.hash(crypto.randomUUID(), 10);
       await connection.query(
         `INSERT INTO users (id, name, email, password_hash, role, status, access_expires_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,

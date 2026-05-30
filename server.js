@@ -174,8 +174,21 @@ app.post("/api/webhooks/cakto", async (req, res) => {
 
   try {
     const payload = req.body || {};
+    const receivedStatus = firstFilledValue(payload, [
+      "status",
+      "payment.status",
+      "transaction.status",
+      "data.status",
+      "subscription.status",
+      "payment_status",
+      "data.payment_status",
+      "data.subscription.status"
+    ]);
     const approved = isApprovedCaktoEvent(payload);
+    console.log("status recebido", receivedStatus || null);
     if (!approved) {
+      console.log("Evento ignorado - não é pagamento aprovado");
+      console.log("status inválido");
       return res.status(200).json({ ok: true, ignored: true, message: "Evento ignorado." });
     }
 
@@ -233,23 +246,38 @@ app.post("/api/webhooks/cakto", async (req, res) => {
       "offer_name",
       "subscription.product_name"
     ]) || "").trim();
+    const plan = inferPlanFromText(offerName);
 
-    if (!buyerEmail || !transactionId) {
+    console.log("email encontrado", buyerEmail || null);
+    console.log("transaction_id encontrado", transactionId || null);
+    console.log("plano identificado", plan || null);
+
+    if (!buyerEmail) {
+      console.log("email ausente");
       return res.status(200).json({
         ok: true,
         ignored: true,
-        message: "Payload aprovado sem email ou transaction_id suficiente para gerar token."
+        message: "Payload aprovado sem email suficiente para gerar token."
       });
     }
 
-    const plan = inferPlanFromText(offerName);
-    console.log("Pagamento aprovado", {
-      status: firstFilledValue(payload, ["status", "payment.status", "transaction.status", "data.status", "subscription.status"]),
-      transactionId,
-      email: buyerEmail,
-      plan,
-      offerName
-    });
+    if (!transactionId) {
+      console.log("transaction_id ausente");
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+        message: "Payload aprovado sem transaction_id suficiente para gerar token."
+      });
+    }
+
+    if (!plan) {
+      console.log("plano não identificado");
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+        message: "Payload aprovado sem plano identificado para gerar token."
+      });
+    }
 
     const [[existingToken]] = await pool.query(
       "SELECT token, email, plan, transaction_id FROM payment_tokens WHERE transaction_id = ? LIMIT 1",
@@ -262,6 +290,7 @@ app.post("/api/webhooks/cakto", async (req, res) => {
 
     const token = generateSecureToken();
     const expiresAt = addDaysToDateTime(7);
+    console.log("Criando token...");
 
     const [insertResult] = await pool.query(
       `INSERT IGNORE INTO payment_tokens (token, email, plan, transaction_id, used, expires_at)
@@ -277,19 +306,11 @@ app.post("/api/webhooks/cakto", async (req, res) => {
       return res.status(200).json({ ok: true, duplicate: true, token: duplicatedRow?.token || null });
     }
 
-    console.log("Token criado", {
-      token,
-      buyerName,
-      buyerEmail,
-      buyerPhone,
-      transactionId,
-      offerName,
-      plan
-    });
+    console.log("Token criado com sucesso", token);
 
     return res.status(200).json({ ok: true, token });
   } catch (error) {
-    console.error("[cakto webhook] erro ao processar payload:", error);
+    console.error("Erro ao criar token", error);
     return res.status(200).json({ ok: false, message: "Webhook recebido, mas nao foi processado." });
   }
 });
@@ -445,7 +466,7 @@ function inferPlanFromText(value) {
   if (text.includes("anual")) return "anual";
   if (text.includes("semestral")) return "semestral";
   if (text.includes("mensal")) return "mensal";
-  return "mensal";
+  return null;
 }
 
 function isApprovedCaktoEvent(payload) {

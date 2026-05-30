@@ -1,0 +1,4 @@
+ALTER TABLE payment_tokens
+  ADD COLUMN IF NOT EXISTS customer_email VARCHAR(160) NULL AFTER email,
+  ADD COLUMN IF NOT EXISTS duration_days INT NOT NULL DEFAULT 30 AFTER plan,
+  ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active' AFTER transaction_id;

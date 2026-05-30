@@ -174,17 +174,9 @@ app.post("/api/webhooks/cakto", async (req, res) => {
 
   try {
     const payload = req.body || {};
-    const receivedStatus = firstFilledValue(payload, [
-      "status",
-      "payment.status",
-      "transaction.status",
-      "data.status",
-      "subscription.status",
-      "payment_status",
-      "data.payment_status",
-      "data.subscription.status"
-    ]);
-    const approved = isApprovedCaktoEvent(payload);
+    const item = Array.isArray(payload.data) ? payload.data[0] : payload.data || payload;
+    const receivedStatus = item?.status || item?.subscription?.status || payload.event || null;
+    const approved = isApprovedCaktoEvent(payload, item);
     console.log("status recebido", receivedStatus || null);
     if (!approved) {
       console.log("Evento ignorado - não é pagamento aprovado");
@@ -192,67 +184,21 @@ app.post("/api/webhooks/cakto", async (req, res) => {
       return res.status(200).json({ ok: true, ignored: true, message: "Evento ignorado." });
     }
 
-    const buyerName = firstFilledValue(payload, [
-      "customer.name",
-      "customer.full_name",
-      "buyer.name",
-      "buyer.full_name",
-      "data.customer.name",
-      "data.customer.full_name"
-    ]);
-    const buyerEmail = String(firstFilledValue(payload, [
-      "customer.email",
-      "buyer.email",
-      "data.customer.email",
-      "data.buyer.email",
-      "contact.email",
-      "customer_email",
-      "email"
-    ]) || "").trim().toLowerCase();
-    const buyerPhone = firstFilledValue(payload, [
-      "customer.phone",
-      "customer.phone_number",
-      "buyer.phone",
-      "data.customer.phone",
-      "data.customer.phone_number",
-      "contact.phone",
-      "phone",
-      "customer_phone"
-    ]);
-    const transactionId = String(firstFilledValue(payload, [
-      "transaction.id",
-      "transaction_id",
-      "payment.id",
-      "payment.transaction_id",
-      "data.id",
-      "data.transaction_id",
-      "order.id",
-      "sale.id",
-      "sale.transaction_id",
-      "invoice.id",
-      "id"
-    ]) || "").trim();
-    const offerName = String(firstFilledValue(payload, [
-      "product.name",
-      "offer.name",
-      "plan.name",
-      "subscription.plan_name",
-      "data.product.name",
-      "data.offer.name",
-      "data.plan.name",
-      "item.name",
-      "items.0.name",
-      "product_name",
-      "offer_name",
-      "subscription.product_name"
-    ]) || "").trim();
-    const plan = inferPlanFromText(offerName);
+    console.log("item processado", item);
 
-    console.log("email encontrado", buyerEmail || null);
-    console.log("transaction_id encontrado", transactionId || null);
+    const email = String(item?.customer?.email || item?.subscription?.customer?.email || "").trim().toLowerCase();
+    const name = String(item?.customer?.name || item?.subscription?.customer?.name || "").trim();
+    const transactionId = String(item?.id || item?.refId || item?.parent_order || "").trim();
+    const productName = String(item?.product?.name || item?.offer?.name || "").trim();
+    const recurrence = Number(item?.subscription?.recurrence_period || 0);
+    const planDetails = inferPlanDetails(productName, recurrence);
+    const { plan, durationDays } = planDetails;
+
+    console.log("email extraído", email || null);
+    console.log("transaction_id extraído", transactionId || null);
     console.log("plano identificado", plan || null);
 
-    if (!buyerEmail) {
+    if (!email) {
       console.log("email ausente");
       return res.status(200).json({
         ok: true,
@@ -270,17 +216,18 @@ app.post("/api/webhooks/cakto", async (req, res) => {
       });
     }
 
-    if (!plan) {
-      console.log("plano não identificado");
+    const paymentTokenColumns = await readPaymentTokenColumns();
+    if (!paymentTokenColumns.has("transaction_id")) {
+      console.error("Tabela payment_tokens sem coluna transaction_id");
       return res.status(200).json({
-        ok: true,
+        ok: false,
         ignored: true,
-        message: "Payload aprovado sem plano identificado para gerar token."
+        message: "Tabela payment_tokens sem coluna transaction_id."
       });
     }
 
     const [[existingToken]] = await pool.query(
-      "SELECT token, email, plan, transaction_id FROM payment_tokens WHERE transaction_id = ? LIMIT 1",
+      "SELECT token, customer_email, email, plan, transaction_id FROM payment_tokens WHERE transaction_id = ? LIMIT 1",
       [transactionId]
     );
 
@@ -289,13 +236,38 @@ app.post("/api/webhooks/cakto", async (req, res) => {
     }
 
     const token = generateSecureToken();
-    const expiresAt = addDaysToDateTime(7);
-    console.log("Criando token...");
+    const expiresAt = addDaysToDateTime(durationDays);
+    console.log("criando token");
 
+    const insertColumns = ["token", "plan", "transaction_id", "used", "created_at"];
+    const insertValues = [token, plan, transactionId, 0, new Date()];
+
+    if (paymentTokenColumns.has("duration_days")) {
+      insertColumns.push("duration_days");
+      insertValues.push(durationDays);
+    }
+    if (paymentTokenColumns.has("customer_email")) {
+      insertColumns.push("customer_email");
+      insertValues.push(email);
+    }
+    if (paymentTokenColumns.has("status")) {
+      insertColumns.push("status");
+      insertValues.push("active");
+    }
+    if (paymentTokenColumns.has("email")) {
+      insertColumns.push("email");
+      insertValues.push(email);
+    }
+    if (paymentTokenColumns.has("expires_at")) {
+      insertColumns.push("expires_at");
+      insertValues.push(expiresAt);
+    }
+
+    const placeholders = insertColumns.map(() => "?").join(", ");
     const [insertResult] = await pool.query(
-      `INSERT IGNORE INTO payment_tokens (token, email, plan, transaction_id, used, expires_at)
-       VALUES (?, ?, ?, ?, FALSE, ?)`,
-      [token, buyerEmail, plan, transactionId, expiresAt]
+      `INSERT IGNORE INTO payment_tokens (${insertColumns.join(", ")})
+       VALUES (${placeholders})`,
+      insertValues
     );
 
     if (!insertResult.affectedRows) {
@@ -306,7 +278,7 @@ app.post("/api/webhooks/cakto", async (req, res) => {
       return res.status(200).json({ ok: true, duplicate: true, token: duplicatedRow?.token || null });
     }
 
-    console.log("Token criado com sucesso", token);
+    console.log("token criado", token);
 
     return res.status(200).json({ ok: true, token });
   } catch (error) {
@@ -322,7 +294,7 @@ app.get("/api/payment-tokens/validate", async (req, res) => {
   }
 
   const [[row]] = await pool.query(
-    `SELECT token, email, plan, used, expires_at
+    `SELECT token, email, customer_email, plan, status, used, expires_at
      FROM payment_tokens
      WHERE token = ?
      LIMIT 1`,
@@ -335,13 +307,16 @@ app.get("/api/payment-tokens/validate", async (req, res) => {
   if (Boolean(row.used)) {
     return res.json({ valid: false });
   }
+  if (row.status && row.status !== "active") {
+    return res.json({ valid: false });
+  }
   if (!isFutureDateTime(row.expires_at)) {
     return res.json({ valid: false });
   }
 
   return res.json({
     valid: true,
-    email: row.email,
+    email: row.customer_email || row.email,
     plan: row.plan
   });
 });
@@ -461,36 +436,27 @@ function generateSecureToken() {
   return crypto.randomBytes(32).toString("hex");
 }
 
-function inferPlanFromText(value) {
-  const text = String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-  if (text.includes("anual")) return "anual";
-  if (text.includes("semestral")) return "semestral";
-  if (text.includes("mensal")) return "mensal";
-  return null;
+function inferPlanDetails(productName, recurrence) {
+  if (recurrence === 30) return { plan: "mensal", durationDays: 30 };
+  if (recurrence === 180) return { plan: "semestral", durationDays: 180 };
+  if (recurrence === 365) return { plan: "anual", durationDays: 365 };
+
+  const text = String(productName || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  if (text.includes("anual")) return { plan: "anual", durationDays: 365 };
+  if (text.includes("semestral")) return { plan: "semestral", durationDays: 180 };
+  if (text.includes("mensal")) return { plan: "mensal", durationDays: 30 };
+  return { plan: "mensal", durationDays: 30 };
 }
 
-function isApprovedCaktoEvent(payload) {
-  const candidates = [
-    firstFilledValue(payload, ["event", "type", "event_name", "data.event", "data.type"]),
-    firstFilledValue(payload, ["status", "payment.status", "transaction.status", "data.status", "order.status"]),
-    firstFilledValue(payload, ["payment_status", "payment.status", "data.payment_status", "subscription.status", "data.subscription.status"])
-  ]
-    .filter(Boolean)
-    .map((value) => String(value).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase());
+function readPaymentTokenColumns() {
+  return pool.query("SHOW COLUMNS FROM payment_tokens").then(([rows]) => new Set(rows.map((row) => row.Field)));
+}
 
-  return candidates.some((value) =>
-    value.includes("approved") ||
-    value.includes("paid") ||
-    value.includes("completed") ||
-    value.includes("success") ||
-    value.includes("active_subscription") ||
-    value.includes("subscription_active") ||
-    value.includes("assinatura ativa") ||
-    value.includes("subscription active") ||
-    value === "active" ||
-    value.includes("aprovado") ||
-    value.includes("pago")
-  );
+function isApprovedCaktoEvent(payload, item) {
+  const eventName = String(payload?.event || "").trim().toLowerCase();
+  const itemStatus = String(item?.status || "").trim().toLowerCase();
+  const subscriptionStatus = String(item?.subscription?.status || "").trim().toLowerCase();
+  return eventName === "purchase_approved" || itemStatus === "paid" || subscriptionStatus === "active";
 }
 
 function firstFilledValue(source, paths) {
@@ -642,6 +608,7 @@ async function start() {
     console.log("AUTO_SEED ativo e tabela users vazia. Criando dados iniciais do Prisma Estudos...");
     await saveStateToDb(seedState);
   }
+  await ensurePaymentTokenSchema();
   await ensureRequiredAdmins();
   app.listen(port, () => {
     console.log(`Prisma Estudos API rodando na porta ${port}`);
@@ -663,6 +630,15 @@ async function ensureRequiredAdmins() {
       [admin.id, admin.name, admin.email, admin.passwordHash]
     );
   }
+}
+
+async function ensurePaymentTokenSchema() {
+  await pool.query(`
+    ALTER TABLE payment_tokens
+      ADD COLUMN IF NOT EXISTS customer_email VARCHAR(160) NULL AFTER email,
+      ADD COLUMN IF NOT EXISTS duration_days INT NOT NULL DEFAULT 30 AFTER plan,
+      ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active' AFTER transaction_id
+  `);
 }
 
 if (require.main === module) {

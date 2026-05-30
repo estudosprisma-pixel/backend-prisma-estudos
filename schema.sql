@@ -119,8 +119,11 @@ CREATE TABLE user_theme_settings (
 CREATE TABLE payment_tokens (
   token VARCHAR(80) PRIMARY KEY,
   email VARCHAR(160) NOT NULL,
+  customer_email VARCHAR(160),
   plan ENUM('mensal', 'semestral', 'anual') NOT NULL DEFAULT 'mensal',
+  duration_days INT NOT NULL DEFAULT 30,
   transaction_id VARCHAR(120) NOT NULL UNIQUE,
+  status VARCHAR(20) NOT NULL DEFAULT 'active',
   used BOOLEAN NOT NULL DEFAULT FALSE,
   expires_at DATETIME NOT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP

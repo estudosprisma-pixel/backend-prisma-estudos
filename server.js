@@ -227,7 +227,7 @@ app.post("/api/webhooks/cakto", async (req, res) => {
     }
 
     const [[existingToken]] = await pool.query(
-      "SELECT token, customer_email, email, plan, transaction_id FROM payment_tokens WHERE transaction_id = ? LIMIT 1",
+      "SELECT token, customer_email, plan, transaction_id FROM payment_tokens WHERE transaction_id = ? LIMIT 1",
       [transactionId]
     );
 
@@ -236,38 +236,13 @@ app.post("/api/webhooks/cakto", async (req, res) => {
     }
 
     const token = generateSecureToken();
-    const expiresAt = addDaysToDateTime(durationDays);
     console.log("criando token");
 
-    const insertColumns = ["token", "plan", "transaction_id", "used", "created_at"];
-    const insertValues = [token, plan, transactionId, 0, new Date()];
-
-    if (paymentTokenColumns.has("duration_days")) {
-      insertColumns.push("duration_days");
-      insertValues.push(durationDays);
-    }
-    if (paymentTokenColumns.has("customer_email")) {
-      insertColumns.push("customer_email");
-      insertValues.push(email);
-    }
-    if (paymentTokenColumns.has("status")) {
-      insertColumns.push("status");
-      insertValues.push("active");
-    }
-    if (paymentTokenColumns.has("email")) {
-      insertColumns.push("email");
-      insertValues.push(email);
-    }
-    if (paymentTokenColumns.has("expires_at")) {
-      insertColumns.push("expires_at");
-      insertValues.push(expiresAt);
-    }
-
-    const placeholders = insertColumns.map(() => "?").join(", ");
     const [insertResult] = await pool.query(
-      `INSERT IGNORE INTO payment_tokens (${insertColumns.join(", ")})
-       VALUES (${placeholders})`,
-      insertValues
+      `INSERT IGNORE INTO payment_tokens
+        (token, plan, duration_days, customer_email, transaction_id, status, used, created_at)
+       VALUES (?, ?, ?, ?, ?, 'active', 0, NOW())`,
+      [token, plan, durationDays, email, transactionId]
     );
 
     if (!insertResult.affectedRows) {
@@ -294,7 +269,7 @@ app.get("/api/payment-tokens/validate", async (req, res) => {
   }
 
   const [[row]] = await pool.query(
-    `SELECT token, email, customer_email, plan, status, used, expires_at
+    `SELECT token, customer_email, plan, duration_days, status, used, used_by_user_id, used_at, created_at
      FROM payment_tokens
      WHERE token = ?
      LIMIT 1`,
@@ -310,13 +285,13 @@ app.get("/api/payment-tokens/validate", async (req, res) => {
   if (row.status && row.status !== "active") {
     return res.json({ valid: false });
   }
-  if (!isFutureDateTime(row.expires_at)) {
+  if (!isPaymentTokenActive(row.created_at, row.duration_days)) {
     return res.json({ valid: false });
   }
 
   return res.json({
     valid: true,
-    email: row.customer_email || row.email,
+    email: row.customer_email,
     plan: row.plan
   });
 });
@@ -420,16 +395,12 @@ function addDaysToToday(days) {
   return date.toISOString().slice(0, 10);
 }
 
-function addDaysToDateTime(days) {
-  const date = new Date();
-  date.setUTCDate(date.getUTCDate() + days);
-  return date.toISOString().slice(0, 19).replace("T", " ");
-}
-
-function isFutureDateTime(value) {
-  if (!value) return false;
-  const expiresAt = new Date(value);
-  return expiresAt.getTime() >= Date.now();
+function isPaymentTokenActive(createdAt, durationDays) {
+  if (!createdAt || !durationDays) return false;
+  const createdTime = new Date(createdAt).getTime();
+  if (Number.isNaN(createdTime)) return false;
+  const expiresAt = createdTime + Number(durationDays) * 24 * 60 * 60 * 1000;
+  return expiresAt >= Date.now();
 }
 
 function generateSecureToken() {
@@ -608,7 +579,6 @@ async function start() {
     console.log("AUTO_SEED ativo e tabela users vazia. Criando dados iniciais do Prisma Estudos...");
     await saveStateToDb(seedState);
   }
-  await ensurePaymentTokenSchema();
   await ensureRequiredAdmins();
   app.listen(port, () => {
     console.log(`Prisma Estudos API rodando na porta ${port}`);
@@ -630,15 +600,6 @@ async function ensureRequiredAdmins() {
       [admin.id, admin.name, admin.email, admin.passwordHash]
     );
   }
-}
-
-async function ensurePaymentTokenSchema() {
-  await pool.query(`
-    ALTER TABLE payment_tokens
-      ADD COLUMN IF NOT EXISTS customer_email VARCHAR(160) NULL AFTER email,
-      ADD COLUMN IF NOT EXISTS duration_days INT NOT NULL DEFAULT 30 AFTER plan,
-      ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active' AFTER transaction_id
-  `);
 }
 
 if (require.main === module) {

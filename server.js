@@ -169,7 +169,7 @@ app.post("/api/auth/register", async (req, res) => {
 });
 
 app.post("/api/webhooks/cakto", async (req, res) => {
-  console.log("[cakto webhook] payload recebido:");
+  console.log("Webhook recebido");
   console.log(JSON.stringify(req.body, null, 2));
 
   try {
@@ -192,7 +192,9 @@ app.post("/api/webhooks/cakto", async (req, res) => {
       "buyer.email",
       "data.customer.email",
       "data.buyer.email",
-      "contact.email"
+      "contact.email",
+      "customer_email",
+      "email"
     ]) || "").trim().toLowerCase();
     const buyerPhone = firstFilledValue(payload, [
       "customer.phone",
@@ -200,7 +202,9 @@ app.post("/api/webhooks/cakto", async (req, res) => {
       "buyer.phone",
       "data.customer.phone",
       "data.customer.phone_number",
-      "contact.phone"
+      "contact.phone",
+      "phone",
+      "customer_phone"
     ]);
     const transactionId = String(firstFilledValue(payload, [
       "transaction.id",
@@ -211,6 +215,8 @@ app.post("/api/webhooks/cakto", async (req, res) => {
       "data.transaction_id",
       "order.id",
       "sale.id",
+      "sale.transaction_id",
+      "invoice.id",
       "id"
     ]) || "").trim();
     const offerName = String(firstFilledValue(payload, [
@@ -222,7 +228,10 @@ app.post("/api/webhooks/cakto", async (req, res) => {
       "data.offer.name",
       "data.plan.name",
       "item.name",
-      "items.0.name"
+      "items.0.name",
+      "product_name",
+      "offer_name",
+      "subscription.product_name"
     ]) || "").trim();
 
     if (!buyerEmail || !transactionId) {
@@ -234,6 +243,14 @@ app.post("/api/webhooks/cakto", async (req, res) => {
     }
 
     const plan = inferPlanFromText(offerName);
+    console.log("Pagamento aprovado", {
+      status: firstFilledValue(payload, ["status", "payment.status", "transaction.status", "data.status", "subscription.status"]),
+      transactionId,
+      email: buyerEmail,
+      plan,
+      offerName
+    });
+
     const [[existingToken]] = await pool.query(
       "SELECT token, email, plan, transaction_id FROM payment_tokens WHERE transaction_id = ? LIMIT 1",
       [transactionId]
@@ -260,7 +277,7 @@ app.post("/api/webhooks/cakto", async (req, res) => {
       return res.status(200).json({ ok: true, duplicate: true, token: duplicatedRow?.token || null });
     }
 
-    console.log("[cakto webhook] token criado:", {
+    console.log("Token criado", {
       token,
       buyerName,
       buyerEmail,
@@ -280,7 +297,7 @@ app.post("/api/webhooks/cakto", async (req, res) => {
 app.get("/api/payment-tokens/validate", async (req, res) => {
   const token = String(req.query?.token || "").trim();
   if (!token) {
-    return res.json({ valid: false, message: "Token nao informado." });
+    return res.json({ valid: false });
   }
 
   const [[row]] = await pool.query(
@@ -292,13 +309,13 @@ app.get("/api/payment-tokens/validate", async (req, res) => {
   );
 
   if (!row) {
-    return res.json({ valid: false, message: "Token nao encontrado." });
+    return res.json({ valid: false });
   }
   if (Boolean(row.used)) {
-    return res.json({ valid: false, message: "Token ja utilizado." });
+    return res.json({ valid: false });
   }
   if (!isFutureDateTime(row.expires_at)) {
-    return res.json({ valid: false, message: "Token expirado." });
+    return res.json({ valid: false });
   }
 
   return res.json({
@@ -435,7 +452,7 @@ function isApprovedCaktoEvent(payload) {
   const candidates = [
     firstFilledValue(payload, ["event", "type", "event_name", "data.event", "data.type"]),
     firstFilledValue(payload, ["status", "payment.status", "transaction.status", "data.status", "order.status"]),
-    firstFilledValue(payload, ["payment_status", "payment.status", "data.payment_status"])
+    firstFilledValue(payload, ["payment_status", "payment.status", "data.payment_status", "subscription.status", "data.subscription.status"])
   ]
     .filter(Boolean)
     .map((value) => String(value).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase());
@@ -445,6 +462,11 @@ function isApprovedCaktoEvent(payload) {
     value.includes("paid") ||
     value.includes("completed") ||
     value.includes("success") ||
+    value.includes("active_subscription") ||
+    value.includes("subscription_active") ||
+    value.includes("assinatura ativa") ||
+    value.includes("subscription active") ||
+    value === "active" ||
     value.includes("aprovado") ||
     value.includes("pago")
   );

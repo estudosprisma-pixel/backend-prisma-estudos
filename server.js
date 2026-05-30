@@ -1,6 +1,7 @@
 require("dotenv").config();
 
 const path = require("path");
+const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 const cors = require("cors");
 const express = require("express");
@@ -74,12 +75,19 @@ app.post("/api/auth/login", async (req, res) => {
   if (!login || !password) return res.status(400).json({ message: "Informe usuario ou email e senha." });
   if (isRateLimited(req, login)) return res.status(429).json({ message: "Muitas tentativas. Aguarde alguns minutos e tente novamente." });
 
-  const [[user]] = await pool.query("SELECT * FROM users WHERE email = ? AND status = 'active' LIMIT 1", [login]);
+  const [[user]] = await pool.query("SELECT * FROM users WHERE email = ? LIMIT 1", [login]);
   if (!user) {
     registerFailedLogin(req, login);
     return res.status(401).json({ message: "Login ou senha invalidos." });
   }
-  if (!isAccessActive(user)) return res.status(403).json({ message: "Seu acesso expirou. Fale com o administrador para renovar." });
+  if (user.status !== "active") {
+    registerFailedLogin(req, login);
+    return res.status(403).json({ message: "Sua conta esta inativa. Entre em contato com o suporte do Prisma Estudos." });
+  }
+  if (!isAccessActive(user)) {
+    registerFailedLogin(req, login);
+    return res.status(403).json({ message: "Seu acesso expirou. Renove sua assinatura para continuar usando o Prisma Estudos." });
+  }
 
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) {
@@ -94,6 +102,210 @@ app.post("/api/auth/login", async (req, res) => {
   state.currentUserId = user.id;
   state.route = user.role === "admin" ? "admin" : "dashboard";
   res.json({ user: publicUser(user), state });
+});
+
+app.post("/api/auth/register", async (req, res) => {
+  const name = String(req.body?.name || "").trim();
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
+  const plan = normalizePlan(req.body?.plan);
+
+  if (!name || !email || password.length < 6) {
+    return res.status(400).json({ message: "Preencha nome, e-mail e uma senha com pelo menos 6 caracteres." });
+  }
+
+  const [[existingUser]] = await pool.query("SELECT id FROM users WHERE email = ? LIMIT 1", [email]);
+  if (existingUser) {
+    return res.status(409).json({ message: "Ja existe uma conta com este e-mail. Faça login para continuar." });
+  }
+
+  const userId = `u-${crypto.randomUUID()}`;
+  const accessExpiresAt = addDaysToToday(PLAN_DURATIONS[plan]);
+  const passwordHash = await bcrypt.hash(password, 10);
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    await connection.query(
+      `INSERT INTO users (id, name, email, password_hash, role, status, access_expires_at)
+       VALUES (?, ?, ?, ?, 'student', 'active', ?)`,
+      [userId, name, email, passwordHash, accessExpiresAt]
+    );
+    await connection.query(
+      `INSERT INTO study_profiles
+        (id, user_id, objective, education_context, daily_minutes, available_days, preferred_time, current_level, review_preference, topics_per_day, mix_subjects, profile_configured, onboarding_completed)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        `sp-${userId}`,
+        userId,
+        "",
+        "",
+        60,
+        JSON.stringify(["Seg", "Ter", "Qua", "Qui", "Sex"]),
+        "19:00",
+        "iniciante",
+        "semanal",
+        2,
+        1,
+        0,
+        0
+      ]
+    );
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+
+  const [[user]] = await pool.query("SELECT * FROM users WHERE id = ? LIMIT 1", [userId]);
+  const token = jwt.sign({ sub: user.id, role: user.role }, jwtSecret, { expiresIn: "8h" });
+  res.setHeader("Set-Cookie", buildAuthCookie(token));
+  const state = filterStateForUser(await readStateFromDb(), publicUser(user));
+  state.currentUserId = user.id;
+  state.route = "profile";
+  res.status(201).json({ user: publicUser(user), state, plan });
+});
+
+app.post("/api/webhooks/cakto", async (req, res) => {
+  console.log("[cakto webhook] payload recebido:");
+  console.log(JSON.stringify(req.body, null, 2));
+
+  try {
+    const payload = req.body || {};
+    const approved = isApprovedCaktoEvent(payload);
+    if (!approved) {
+      return res.status(200).json({ ok: true, ignored: true, message: "Evento ignorado." });
+    }
+
+    const buyerName = firstFilledValue(payload, [
+      "customer.name",
+      "customer.full_name",
+      "buyer.name",
+      "buyer.full_name",
+      "data.customer.name",
+      "data.customer.full_name"
+    ]);
+    const buyerEmail = String(firstFilledValue(payload, [
+      "customer.email",
+      "buyer.email",
+      "data.customer.email",
+      "data.buyer.email",
+      "contact.email"
+    ]) || "").trim().toLowerCase();
+    const buyerPhone = firstFilledValue(payload, [
+      "customer.phone",
+      "customer.phone_number",
+      "buyer.phone",
+      "data.customer.phone",
+      "data.customer.phone_number",
+      "contact.phone"
+    ]);
+    const transactionId = String(firstFilledValue(payload, [
+      "transaction.id",
+      "transaction_id",
+      "payment.id",
+      "payment.transaction_id",
+      "data.id",
+      "data.transaction_id",
+      "order.id",
+      "sale.id",
+      "id"
+    ]) || "").trim();
+    const offerName = String(firstFilledValue(payload, [
+      "product.name",
+      "offer.name",
+      "plan.name",
+      "subscription.plan_name",
+      "data.product.name",
+      "data.offer.name",
+      "data.plan.name",
+      "item.name",
+      "items.0.name"
+    ]) || "").trim();
+
+    if (!buyerEmail || !transactionId) {
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+        message: "Payload aprovado sem email ou transaction_id suficiente para gerar token."
+      });
+    }
+
+    const plan = inferPlanFromText(offerName);
+    const [[existingToken]] = await pool.query(
+      "SELECT token, email, plan, transaction_id FROM payment_tokens WHERE transaction_id = ? LIMIT 1",
+      [transactionId]
+    );
+
+    if (existingToken) {
+      return res.status(200).json({ ok: true, duplicate: true, token: existingToken.token });
+    }
+
+    const token = generateSecureToken();
+    const expiresAt = addDaysToDateTime(7);
+
+    const [insertResult] = await pool.query(
+      `INSERT IGNORE INTO payment_tokens (token, email, plan, transaction_id, used, expires_at)
+       VALUES (?, ?, ?, ?, FALSE, ?)`,
+      [token, buyerEmail, plan, transactionId, expiresAt]
+    );
+
+    if (!insertResult.affectedRows) {
+      const [[duplicatedRow]] = await pool.query(
+        "SELECT token FROM payment_tokens WHERE transaction_id = ? LIMIT 1",
+        [transactionId]
+      );
+      return res.status(200).json({ ok: true, duplicate: true, token: duplicatedRow?.token || null });
+    }
+
+    console.log("[cakto webhook] token criado:", {
+      token,
+      buyerName,
+      buyerEmail,
+      buyerPhone,
+      transactionId,
+      offerName,
+      plan
+    });
+
+    return res.status(200).json({ ok: true, token });
+  } catch (error) {
+    console.error("[cakto webhook] erro ao processar payload:", error);
+    return res.status(200).json({ ok: false, message: "Webhook recebido, mas nao foi processado." });
+  }
+});
+
+app.get("/api/payment-tokens/validate", async (req, res) => {
+  const token = String(req.query?.token || "").trim();
+  if (!token) {
+    return res.json({ valid: false, message: "Token nao informado." });
+  }
+
+  const [[row]] = await pool.query(
+    `SELECT token, email, plan, used, expires_at
+     FROM payment_tokens
+     WHERE token = ?
+     LIMIT 1`,
+    [token]
+  );
+
+  if (!row) {
+    return res.json({ valid: false, message: "Token nao encontrado." });
+  }
+  if (Boolean(row.used)) {
+    return res.json({ valid: false, message: "Token ja utilizado." });
+  }
+  if (!isFutureDateTime(row.expires_at)) {
+    return res.json({ valid: false, message: "Token expirado." });
+  }
+
+  return res.json({
+    valid: true,
+    email: row.email,
+    plan: row.plan
+  });
 });
 
 app.post("/api/auth/logout", (_req, res) => {
@@ -176,6 +388,81 @@ function normalizeLoginIdentifier(value) {
   if (!login) return "";
   if (login.includes("@")) return login;
   return loginAliases[login] || `${login}@prismaestudos.local`;
+}
+
+const PLAN_DURATIONS = {
+  mensal: 30,
+  semestral: 180,
+  anual: 365
+};
+
+function normalizePlan(value) {
+  const plan = String(value || "").trim().toLowerCase();
+  return PLAN_DURATIONS[plan] ? plan : "mensal";
+}
+
+function addDaysToToday(days) {
+  const date = new Date();
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function addDaysToDateTime(days) {
+  const date = new Date();
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 19).replace("T", " ");
+}
+
+function isFutureDateTime(value) {
+  if (!value) return false;
+  const expiresAt = new Date(value);
+  return expiresAt.getTime() >= Date.now();
+}
+
+function generateSecureToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+function inferPlanFromText(value) {
+  const text = String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  if (text.includes("anual")) return "anual";
+  if (text.includes("semestral")) return "semestral";
+  if (text.includes("mensal")) return "mensal";
+  return "mensal";
+}
+
+function isApprovedCaktoEvent(payload) {
+  const candidates = [
+    firstFilledValue(payload, ["event", "type", "event_name", "data.event", "data.type"]),
+    firstFilledValue(payload, ["status", "payment.status", "transaction.status", "data.status", "order.status"]),
+    firstFilledValue(payload, ["payment_status", "payment.status", "data.payment_status"])
+  ]
+    .filter(Boolean)
+    .map((value) => String(value).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase());
+
+  return candidates.some((value) =>
+    value.includes("approved") ||
+    value.includes("paid") ||
+    value.includes("completed") ||
+    value.includes("success") ||
+    value.includes("aprovado") ||
+    value.includes("pago")
+  );
+}
+
+function firstFilledValue(source, paths) {
+  for (const pathName of paths) {
+    const value = valueAtPath(source, pathName);
+    if (value !== undefined && value !== null && String(value).trim() !== "") return value;
+  }
+  return "";
+}
+
+function valueAtPath(source, pathName) {
+  return String(pathName || "")
+    .split(".")
+    .filter(Boolean)
+    .reduce((current, key) => (current === undefined || current === null ? undefined : current[key]), source);
 }
 
 function buildAuthCookie(token) {

@@ -108,28 +108,56 @@ app.post("/api/auth/register", async (req, res) => {
   const name = String(req.body?.name || "").trim();
   const email = String(req.body?.email || "").trim().toLowerCase();
   const password = String(req.body?.password || "");
-  const plan = normalizePlan(req.body?.plan);
+  const paymentToken = String(req.body?.token || "").trim();
 
-  if (!name || !email || password.length < 6) {
-    return res.status(400).json({ message: "Preencha nome, e-mail e uma senha com pelo menos 6 caracteres." });
+  if (!paymentToken) {
+    return res.status(400).json({ message: "Cadastro disponivel apenas apos a confirmacao da compra." });
   }
 
-  const [[existingUser]] = await pool.query("SELECT id FROM users WHERE email = ? LIMIT 1", [email]);
-  if (existingUser) {
-    return res.status(409).json({ message: "Ja existe uma conta com este e-mail. Faça login para continuar." });
+  if (!name || password.length < 6) {
+    return res.status(400).json({ message: "Preencha nome e uma senha com pelo menos 6 caracteres." });
   }
 
   const userId = `u-${crypto.randomUUID()}`;
-  const accessExpiresAt = addDaysToToday(PLAN_DURATIONS[plan]);
   const passwordHash = await bcrypt.hash(password, 10);
 
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
+    const tokenRow = await getPaymentTokenRecord(connection, paymentToken, { lock: true });
+    const tokenStatus = describePaymentTokenStatus(tokenRow);
+
+    if (!tokenStatus.valid) {
+      await connection.rollback();
+      return res.status(400).json({ message: "Link invalido, expirado ou ja utilizado." });
+    }
+
+    const plan = normalizePlan(tokenRow.plan);
+    const durationDays = PLAN_DURATIONS[plan];
+    const tokenEmail = String(tokenRow.customer_email || "").trim().toLowerCase();
+    const finalEmail = tokenEmail || email;
+
+    if (!finalEmail) {
+      await connection.rollback();
+      return res.status(400).json({ message: "Nao foi possivel identificar o e-mail vinculado a compra." });
+    }
+
+    if (tokenEmail && email && tokenEmail !== email) {
+      await connection.rollback();
+      return res.status(400).json({ message: "Use o e-mail vinculado a compra para concluir o cadastro." });
+    }
+
+    const [[existingUser]] = await connection.query("SELECT id FROM users WHERE email = ? LIMIT 1", [finalEmail]);
+    if (existingUser) {
+      await connection.rollback();
+      return res.status(409).json({ message: "Ja existe uma conta com este e-mail. Faca login para continuar." });
+    }
+
+    const accessExpiresAt = addDaysToToday(durationDays);
     await connection.query(
       `INSERT INTO users (id, name, email, password_hash, role, status, access_expires_at)
        VALUES (?, ?, ?, ?, 'student', 'active', ?)`,
-      [userId, name, email, passwordHash, accessExpiresAt]
+      [userId, name, finalEmail, passwordHash, accessExpiresAt]
     );
     await connection.query(
       `INSERT INTO study_profiles
@@ -151,21 +179,36 @@ app.post("/api/auth/register", async (req, res) => {
         0
       ]
     );
+
+    const [tokenUpdate] = await connection.query(
+      `UPDATE payment_tokens
+       SET used = 1,
+           used_by_user_id = ?,
+           used_at = NOW()
+       WHERE token = ?
+         AND used = 0`,
+      [userId, paymentToken]
+    );
+
+    if (tokenUpdate.affectedRows !== 1) {
+      throw new Error("Nao foi possivel marcar o token como utilizado.");
+    }
+
     await connection.commit();
+
+    const [[user]] = await pool.query("SELECT * FROM users WHERE id = ? LIMIT 1", [userId]);
+    const token = jwt.sign({ sub: user.id, role: user.role }, jwtSecret, { expiresIn: "8h" });
+    res.setHeader("Set-Cookie", buildAuthCookie(token));
+    const state = filterStateForUser(await readStateFromDb(), publicUser(user));
+    state.currentUserId = user.id;
+    state.route = "profile";
+    return res.status(201).json({ user: publicUser(user), state, plan });
   } catch (error) {
     await connection.rollback();
     throw error;
   } finally {
     connection.release();
   }
-
-  const [[user]] = await pool.query("SELECT * FROM users WHERE id = ? LIMIT 1", [userId]);
-  const token = jwt.sign({ sub: user.id, role: user.role }, jwtSecret, { expiresIn: "8h" });
-  res.setHeader("Set-Cookie", buildAuthCookie(token));
-  const state = filterStateForUser(await readStateFromDb(), publicUser(user));
-  state.currentUserId = user.id;
-  state.route = "profile";
-  res.status(201).json({ user: publicUser(user), state, plan });
 });
 
 app.post("/api/webhooks/cakto", async (req, res) => {
@@ -268,31 +311,17 @@ app.get("/api/payment-tokens/validate", async (req, res) => {
     return res.json({ valid: false });
   }
 
-  const [[row]] = await pool.query(
-    `SELECT token, customer_email, plan, duration_days, status, used, used_by_user_id, used_at, created_at
-     FROM payment_tokens
-     WHERE token = ?
-     LIMIT 1`,
-    [token]
-  );
+  const row = await getPaymentTokenRecord(pool, token);
+  const tokenStatus = describePaymentTokenStatus(row);
 
-  if (!row) {
-    return res.json({ valid: false });
-  }
-  if (Boolean(row.used)) {
-    return res.json({ valid: false });
-  }
-  if (row.status && row.status !== "active") {
-    return res.json({ valid: false });
-  }
-  if (!isPaymentTokenActive(row.created_at, row.duration_days)) {
+  if (!tokenStatus.valid) {
     return res.json({ valid: false });
   }
 
   return res.json({
     valid: true,
     email: row.customer_email,
-    plan: row.plan
+    plan: normalizePlan(row.plan)
   });
 });
 
@@ -405,6 +434,26 @@ function isPaymentTokenActive(createdAt, durationDays) {
 
 function generateSecureToken() {
   return crypto.randomBytes(32).toString("hex");
+}
+
+async function getPaymentTokenRecord(executor, token, options = {}) {
+  const lockClause = options.lock ? " FOR UPDATE" : "";
+  const [[row]] = await executor.query(
+    `SELECT token, plan, duration_days, customer_email, transaction_id, status, used, used_by_user_id, used_at, created_at
+     FROM payment_tokens
+     WHERE token = ?
+     LIMIT 1${lockClause}`,
+    [token]
+  );
+  return row || null;
+}
+
+function describePaymentTokenStatus(row) {
+  if (!row) return { valid: false, reason: "missing" };
+  if (Boolean(row.used)) return { valid: false, reason: "used" };
+  if (row.status && row.status !== "active") return { valid: false, reason: "inactive" };
+  if (!isPaymentTokenActive(row.created_at, row.duration_days)) return { valid: false, reason: "expired" };
+  return { valid: true, reason: "ok" };
 }
 
 function inferPlanDetails(productName, recurrence) {

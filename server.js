@@ -409,7 +409,7 @@ function normalizeLoginIdentifier(value) {
 
 const PLAN_DURATIONS = {
   mensal: 30,
-  semestral: 180,
+  trimestral: 90,
   anual: 365
 };
 
@@ -458,12 +458,12 @@ function describePaymentTokenStatus(row) {
 
 function inferPlanDetails(productName, recurrence) {
   if (recurrence === 30) return { plan: "mensal", durationDays: 30 };
-  if (recurrence === 180) return { plan: "semestral", durationDays: 180 };
+  if (recurrence === 90) return { plan: "trimestral", durationDays: 90 };
   if (recurrence === 365) return { plan: "anual", durationDays: 365 };
 
   const text = String(productName || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
   if (text.includes("anual")) return { plan: "anual", durationDays: 365 };
-  if (text.includes("semestral")) return { plan: "semestral", durationDays: 180 };
+  if (text.includes("trimestral")) return { plan: "trimestral", durationDays: 90 };
   if (text.includes("mensal")) return { plan: "mensal", durationDays: 30 };
   return { plan: "mensal", durationDays: 30 };
 }

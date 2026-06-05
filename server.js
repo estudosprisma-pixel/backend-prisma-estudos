@@ -338,15 +338,25 @@ app.get("/api/state", requireAuth, async (req, res) => {
 });
 
 app.put("/api/state", requireAuth, async (req, res) => {
-  const incoming = req.body?.state;
-  if (!incoming || !Array.isArray(incoming.users)) return res.status(400).json({ message: "Estado invalido." });
-  incoming.currentUserId = req.user.id;
-  const stateToSave = req.user.role === "admin" ? incoming : mergeStudentState(await readStateFromDb(), incoming, req.user.id);
-  await saveStateToDb(stateToSave);
-  const state = filterStateForUser(await readStateFromDb(), req.user);
-  state.currentUserId = req.user.id;
-  state.route = incoming.route || (req.user.role === "admin" ? "admin" : "dashboard");
-  res.json({ state });
+  try {
+    const incoming = req.body?.state;
+    if (!incoming || !Array.isArray(incoming.users)) return res.status(400).json({ message: "Estado invalido." });
+    incoming.currentUserId = req.user.id;
+    const stateToSave = req.user.role === "admin" ? incoming : mergeStudentState(await readStateFromDb(), incoming, req.user.id);
+    await saveStateToDb(stateToSave);
+    const state = filterStateForUser(await readStateFromDb(), req.user);
+    state.currentUserId = req.user.id;
+    state.route = incoming.route || (req.user.role === "admin" ? "admin" : "dashboard");
+    res.json({ state });
+  } catch (error) {
+    console.error("Erro ao salvar estado do usuario", {
+      userId: req.user?.id,
+      code: error.code,
+      message: error.message,
+      sqlMessage: error.sqlMessage
+    });
+    res.status(500).json({ message: "Erro ao salvar estado." });
+  }
 });
 
 app.post("/api/dev/seed", async (_req, res) => {

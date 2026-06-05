@@ -130,6 +130,15 @@ async function saveStateToDb(state) {
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
+    const validUserIds = new Set((state.users || []).map((user) => user.id));
+    const validSubjects = (state.subjects || []).filter((subject) => subject?.id);
+    const validSubjectIds = new Set(validSubjects.map((subject) => subject.id));
+    const validTopics = (state.topics || []).filter((topic) => {
+      const valid = topic?.id && validSubjectIds.has(topic.subjectId);
+      if (!valid) console.warn("Ignorando topico sem materia correspondente ao salvar estado", { topicId: topic?.id, subjectId: topic?.subjectId });
+      return valid;
+    });
+    const validTopicIds = new Set(validTopics.map((topic) => topic.id));
     const [existingUsers] = await connection.query("SELECT id, password_hash FROM users");
     const passwordHashes = new Map(existingUsers.map((user) => [user.id, user.password_hash]));
     await connection.query("DELETE FROM reviews");
@@ -156,19 +165,34 @@ async function saveStateToDb(state) {
       );
     }
 
-    for (const subject of state.subjects || []) {
+    for (const subject of validSubjects) {
       await connection.query(
         `INSERT INTO subjects (id, name, color, is_base, owner_user_id, created_by_admin_id)
          VALUES (?, ?, ?, ?, ?, ?)`,
-        [subject.id, subject.name, subject.color || "#22d3ee", bool(subject.isBase), subject.ownerId || null, subject.isBase ? state.currentUserId || null : null]
+        [
+          subject.id,
+          subject.name,
+          subject.color || "#22d3ee",
+          bool(subject.isBase),
+          subject.ownerId && validUserIds.has(subject.ownerId) ? subject.ownerId : null,
+          subject.isBase && state.currentUserId && validUserIds.has(state.currentUserId) ? state.currentUserId : null
+        ]
       );
     }
 
-    for (const topic of state.topics || []) {
+    for (const topic of validTopics) {
       await connection.query(
         `INSERT INTO topics (id, subject_id, title, topic_order, suggested_minutes, is_base, owner_user_id)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [topic.id, topic.subjectId, topic.title, topic.order || 1, topic.suggestedMinutes || 45, bool(topic.isBase), topic.ownerId || null]
+        [
+          topic.id,
+          topic.subjectId,
+          topic.title,
+          topic.order || 1,
+          topic.suggestedMinutes || 45,
+          bool(topic.isBase),
+          topic.ownerId && validUserIds.has(topic.ownerId) ? topic.ownerId : null
+        ]
       );
     }
 
@@ -197,7 +221,15 @@ async function saveStateToDb(state) {
     }
 
     for (const [userId, subjectIds] of Object.entries(state.userSubjects || {})) {
+      if (!validUserIds.has(userId)) {
+        console.warn("Ignorando materias de usuario inexistente ao salvar estado", { userId });
+        continue;
+      }
       for (const subjectId of subjectIds || []) {
+        if (!validSubjectIds.has(subjectId)) {
+          console.warn("Ignorando user_subject sem materia correspondente ao salvar estado", { userId, subjectId });
+          continue;
+        }
         await connection.query("INSERT IGNORE INTO user_subjects (user_id, subject_id) VALUES (?, ?)", [userId, subjectId]);
       }
     }
@@ -205,7 +237,15 @@ async function saveStateToDb(state) {
     const userTopicColumns = await tableColumns(connection, "user_topics");
     const hasTopicChecklistColumns = ["theory_read", "summary_done", "exercises_done"].every((column) => userTopicColumns.has(column));
     for (const [userId, topics] of Object.entries(state.userTopics || {})) {
+      if (!validUserIds.has(userId)) {
+        console.warn("Ignorando topicos de usuario inexistente ao salvar estado", { userId });
+        continue;
+      }
       for (const [topicId, topicState] of Object.entries(topics || {})) {
+        if (!validTopicIds.has(topicId)) {
+          console.warn("Ignorando user_topic sem topico correspondente ao salvar estado", { userId, topicId });
+          continue;
+        }
         if (hasTopicChecklistColumns) {
           await connection.query(
             `INSERT INTO user_topics
@@ -234,6 +274,15 @@ async function saveStateToDb(state) {
     }
 
     for (const session of state.sessions || []) {
+      if (!validUserIds.has(session.userId) || !validSubjectIds.has(session.subjectId) || !validTopicIds.has(session.topicId)) {
+        console.warn("Ignorando sessao com referencia inexistente ao salvar estado", {
+          sessionId: session.id,
+          userId: session.userId,
+          subjectId: session.subjectId,
+          topicId: session.topicId
+        });
+        continue;
+      }
       await connection.query(
         `INSERT INTO study_sessions
           (id, user_id, subject_id, topic_id, started_at, finished_at, planned_minutes, studied_minutes, result, notes)
@@ -254,6 +303,15 @@ async function saveStateToDb(state) {
     }
 
     for (const review of state.reviews || []) {
+      if (!validUserIds.has(review.userId) || !validSubjectIds.has(review.subjectId) || !validTopicIds.has(review.topicId)) {
+        console.warn("Ignorando revisao com referencia inexistente ao salvar estado", {
+          reviewId: review.id,
+          userId: review.userId,
+          subjectId: review.subjectId,
+          topicId: review.topicId
+        });
+        continue;
+      }
       await connection.query(
         `INSERT INTO reviews
           (id, user_id, subject_id, topic_id, original_study_date, due_date, review_count, status, completed_at)

@@ -470,6 +470,73 @@ function mapReviewRow(row) {
   };
 }
 
+// ── User Preferences API ──────────────────────────────────────────────────────
+
+const DEFAULT_PREFERENCES = {
+  theme: "dark",
+  accentColor: "blue",
+  studyGoal: "",
+  dailyStudyMinutes: 60,
+  preferredSubjects: [],
+  notificationsEnabled: true,
+  soundEnabled: true,
+  layoutMode: "default"
+};
+
+function mapPrefRow(row) {
+  let subjects = [];
+  try { subjects = typeof row.preferred_subjects === "string" ? JSON.parse(row.preferred_subjects) : (row.preferred_subjects || []); } catch {}
+  return {
+    theme: row.theme || "dark",
+    accentColor: row.accent_color || "blue",
+    studyGoal: row.study_goal || "",
+    dailyStudyMinutes: Number(row.daily_study_minutes || 60),
+    preferredSubjects: Array.isArray(subjects) ? subjects : [],
+    notificationsEnabled: Boolean(row.notifications_enabled),
+    soundEnabled: Boolean(row.sound_enabled),
+    layoutMode: row.layout_mode || "default"
+  };
+}
+
+app.get("/api/preferences", requireAuth, async (req, res) => {
+  const [[row]] = await pool.query("SELECT * FROM user_preferences WHERE user_id = ? LIMIT 1", [req.user.id]);
+  if (!row) return res.json({ preferences: { ...DEFAULT_PREFERENCES } });
+  res.json({ preferences: mapPrefRow(row) });
+});
+
+app.put("/api/preferences", requireAuth, async (req, res) => {
+  const { theme, accentColor, studyGoal, dailyStudyMinutes, preferredSubjects, notificationsEnabled, soundEnabled, layoutMode } = req.body || {};
+  const id = `up-${req.user.id}`;
+  const subjects = Array.isArray(preferredSubjects) ? JSON.stringify(preferredSubjects) : "[]";
+  await pool.query(
+    `INSERT INTO user_preferences (id, user_id, theme, accent_color, study_goal, daily_study_minutes, preferred_subjects, notifications_enabled, sound_enabled, layout_mode)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       theme = VALUES(theme),
+       accent_color = VALUES(accent_color),
+       study_goal = VALUES(study_goal),
+       daily_study_minutes = VALUES(daily_study_minutes),
+       preferred_subjects = VALUES(preferred_subjects),
+       notifications_enabled = VALUES(notifications_enabled),
+       sound_enabled = VALUES(sound_enabled),
+       layout_mode = VALUES(layout_mode),
+       updated_at = NOW()`,
+    [
+      id, req.user.id,
+      theme || "dark",
+      accentColor || "blue",
+      studyGoal || "",
+      Number(dailyStudyMinutes || 60),
+      subjects,
+      notificationsEnabled !== false ? 1 : 0,
+      soundEnabled !== false ? 1 : 0,
+      layoutMode || "default"
+    ]
+  );
+  const [[row]] = await pool.query("SELECT * FROM user_preferences WHERE user_id = ?", [req.user.id]);
+  res.json({ preferences: mapPrefRow(row) });
+});
+
 // ── Error handler ─────────────────────────────────────────────────────────────
 
 app.use((error, _req, res, _next) => {
@@ -747,6 +814,7 @@ async function start() {
   }
   await ensureRequiredAdmins();
   await ensureStudyReviewsTable();
+  await ensureUserPreferencesTable();
   app.listen(port, () => {
     console.log(`Prisma Estudos API rodando na porta ${port}`);
   });
@@ -776,6 +844,31 @@ async function ensureStudyReviewsTable() {
     console.log("Tabela study_reviews verificada/criada.");
   } catch (error) {
     console.error("Erro ao criar tabela study_reviews:", error.message);
+  }
+}
+
+async function ensureUserPreferencesTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_preferences (
+        id                    VARCHAR(40)  PRIMARY KEY,
+        user_id               VARCHAR(40)  NOT NULL UNIQUE,
+        theme                 VARCHAR(20)  NOT NULL DEFAULT 'dark',
+        accent_color          VARCHAR(30)  NOT NULL DEFAULT 'blue',
+        study_goal            VARCHAR(255) NOT NULL DEFAULT '',
+        daily_study_minutes   INT          NOT NULL DEFAULT 60,
+        preferred_subjects    JSON,
+        notifications_enabled BOOLEAN      NOT NULL DEFAULT 1,
+        sound_enabled         BOOLEAN      NOT NULL DEFAULT 1,
+        layout_mode           VARCHAR(20)  NOT NULL DEFAULT 'default',
+        created_at            TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at            TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+    console.log("Tabela user_preferences verificada/criada.");
+  } catch (error) {
+    console.error("Erro ao criar tabela user_preferences:", error.message);
   }
 }
 

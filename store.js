@@ -76,6 +76,7 @@ async function readStateFromDb() {
       days: parseJson(profile.available_days, []),
       preferredTime: profile.preferred_time || "19:00",
       interests: [],
+      extraInterests: [],
       level: profile.current_level,
       reviewPreference: profile.review_preference,
       topicsPerDay: profile.topics_per_day,
@@ -93,6 +94,9 @@ async function readStateFromDb() {
   Object.entries(state.userSubjects).forEach(([userId, subjectIds]) => {
     state.profiles[userId] ||= {};
     state.profiles[userId].interests = subjectIds;
+    state.profiles[userId].extraInterests = subjectIds.filter((subjectId) =>
+      state.subjects.some((subject) => subject.id === subjectId && subject.ownerId === userId && !subject.isBase)
+    );
   });
 
   userTopics.forEach((row) => {

@@ -101,6 +101,9 @@ async function readStateFromDb() {
       status: fromDbStatus(row.status),
       progress: row.progress_percent,
       unlocked: Boolean(row.unlocked),
+      ...("theory_read" in row ? { theoryRead: Boolean(row.theory_read) } : {}),
+      ...("summary_done" in row ? { summaryDone: Boolean(row.summary_done) } : {}),
+      ...("exercises_done" in row ? { exercisesDone: Boolean(row.exercises_done) } : {}),
       completedAt: dateOnly(row.completed_at)
     };
   });
@@ -195,13 +198,34 @@ async function saveStateToDb(state) {
       }
     }
 
+    const userTopicColumns = await tableColumns(connection, "user_topics");
+    const hasTopicChecklistColumns = ["theory_read", "summary_done", "exercises_done"].every((column) => userTopicColumns.has(column));
     for (const [userId, topics] of Object.entries(state.userTopics || {})) {
       for (const [topicId, topicState] of Object.entries(topics || {})) {
-        await connection.query(
-          `INSERT INTO user_topics (user_id, topic_id, status, progress_percent, unlocked, completed_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [userId, topicId, toDbStatus(topicState.status), Number(topicState.progress || 0), bool(topicState.unlocked), topicState.completedAt || null]
-        );
+        if (hasTopicChecklistColumns) {
+          await connection.query(
+            `INSERT INTO user_topics
+              (user_id, topic_id, status, progress_percent, unlocked, theory_read, summary_done, exercises_done, completed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              userId,
+              topicId,
+              toDbStatus(topicState.status),
+              Number(topicState.progress || 0),
+              bool(topicState.unlocked),
+              bool(topicState.theoryRead),
+              bool(topicState.summaryDone),
+              bool(topicState.exercisesDone),
+              topicState.completedAt || null
+            ]
+          );
+        } else {
+          await connection.query(
+            `INSERT INTO user_topics (user_id, topic_id, status, progress_percent, unlocked, completed_at)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [userId, topicId, toDbStatus(topicState.status), Number(topicState.progress || 0), bool(topicState.unlocked), topicState.completedAt || null]
+          );
+        }
       }
     }
 
@@ -286,6 +310,12 @@ async function readOptionalTable(tableName, query) {
 async function tableExists(executor, tableName) {
   const [rows] = await executor.query("SHOW TABLES LIKE ?", [tableName]);
   return rows.length > 0;
+}
+
+async function tableColumns(executor, tableName) {
+  if (!(await tableExists(executor, tableName))) return new Set();
+  const [rows] = await executor.query(`SHOW COLUMNS FROM ${tableName}`);
+  return new Set(rows.map((row) => row.Field));
 }
 
 function parseJson(value, fallback) {

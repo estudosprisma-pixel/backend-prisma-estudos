@@ -355,6 +355,123 @@ app.post("/api/dev/seed", async (_req, res) => {
   res.json({ ok: true });
 });
 
+// ── Study Reviews API ────────────────────────────────────────────────────────
+
+app.get("/api/reviews/today", requireAuth, async (req, res) => {
+  const today = new Date().toISOString().slice(0, 10);
+  const [rows] = await pool.query(
+    `SELECT * FROM study_reviews
+     WHERE user_id = ?
+       AND status = 'pendente'
+       AND (next_review_date IS NULL OR next_review_date <= ?)
+     ORDER BY next_review_date ASC, created_at ASC`,
+    [req.user.id, today]
+  );
+  res.json({ reviews: rows.map(mapReviewRow) });
+});
+
+app.get("/api/reviews", requireAuth, async (req, res) => {
+  const [rows] = await pool.query(
+    "SELECT * FROM study_reviews WHERE user_id = ? ORDER BY created_at DESC",
+    [req.user.id]
+  );
+  res.json({ reviews: rows.map(mapReviewRow) });
+});
+
+app.post("/api/reviews", requireAuth, async (req, res) => {
+  const { title, subject, topic, difficulty, notes, next_review_date } = req.body || {};
+  if (!title || !String(title).trim()) {
+    return res.status(400).json({ message: "O campo titulo e obrigatorio." });
+  }
+  const id = `sr-${crypto.randomUUID()}`;
+  const today = new Date().toISOString().slice(0, 10);
+  const dayMap = { facil: 7, medio: 3, dificil: 1 };
+  const nextDate = next_review_date || addDaysToToday(dayMap[difficulty] ?? 3);
+  await pool.query(
+    `INSERT INTO study_reviews
+      (id, user_id, title, subject, topic, reviewed_at, next_review_date, status, difficulty, notes)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'pendente', ?, ?)`,
+    [id, req.user.id, String(title).trim(), subject || null, topic || null,
+     today, nextDate, difficulty || null, notes || null]
+  );
+  const [[row]] = await pool.query("SELECT * FROM study_reviews WHERE id = ?", [id]);
+  res.status(201).json({ review: mapReviewRow(row) });
+});
+
+app.patch("/api/reviews/:id", requireAuth, async (req, res) => {
+  const [[existing]] = await pool.query(
+    "SELECT id, difficulty FROM study_reviews WHERE id = ? AND user_id = ?",
+    [req.params.id, req.user.id]
+  );
+  if (!existing) return res.status(404).json({ message: "Revisao nao encontrada." });
+
+  const { title, subject, topic, difficulty, notes, status, next_review_date } = req.body || {};
+  const fields = [];
+  const values = [];
+
+  if (title !== undefined) { fields.push("title = ?"); values.push(String(title).trim()); }
+  if (subject !== undefined) { fields.push("subject = ?"); values.push(subject || null); }
+  if (topic !== undefined) { fields.push("topic = ?"); values.push(topic || null); }
+  if (difficulty !== undefined) { fields.push("difficulty = ?"); values.push(difficulty || null); }
+  if (notes !== undefined) { fields.push("notes = ?"); values.push(notes || null); }
+  if (status !== undefined) { fields.push("status = ?"); values.push(status); }
+
+  if (next_review_date !== undefined) {
+    fields.push("next_review_date = ?");
+    values.push(next_review_date || null);
+  } else if (status === "concluida") {
+    const dayMap = { facil: 7, medio: 3, dificil: 1 };
+    const eff = difficulty || existing.difficulty;
+    fields.push("next_review_date = ?");
+    values.push(addDaysToToday(dayMap[eff] ?? 3));
+  }
+
+  if (status === "concluida") {
+    fields.push("reviewed_at = ?");
+    values.push(new Date().toISOString().slice(0, 10));
+  }
+
+  if (fields.length) {
+    fields.push("updated_at = NOW()");
+    values.push(req.params.id, req.user.id);
+    await pool.query(
+      `UPDATE study_reviews SET ${fields.join(", ")} WHERE id = ? AND user_id = ?`,
+      values
+    );
+  }
+
+  const [[updated]] = await pool.query("SELECT * FROM study_reviews WHERE id = ?", [req.params.id]);
+  res.json({ review: mapReviewRow(updated) });
+});
+
+app.delete("/api/reviews/:id", requireAuth, async (req, res) => {
+  const [result] = await pool.query(
+    "DELETE FROM study_reviews WHERE id = ? AND user_id = ?",
+    [req.params.id, req.user.id]
+  );
+  if (!result.affectedRows) return res.status(404).json({ message: "Revisao nao encontrada." });
+  res.json({ ok: true });
+});
+
+function mapReviewRow(row) {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    title: row.title,
+    subject: row.subject || "",
+    topic: row.topic || "",
+    reviewedAt: dateOnly(row.reviewed_at),
+    nextReviewDate: dateOnly(row.next_review_date),
+    status: row.status,
+    difficulty: row.difficulty || null,
+    notes: row.notes || "",
+    createdAt: dateOnly(row.created_at),
+    updatedAt: dateOnly(row.updated_at)
+  };
+}
+
+// ── Error handler ─────────────────────────────────────────────────────────────
+
 app.use((error, _req, res, _next) => {
   const status = error.status || 500;
   if (status >= 500) console.error(error);
@@ -629,9 +746,37 @@ async function start() {
     await saveStateToDb(seedState);
   }
   await ensureRequiredAdmins();
+  await ensureStudyReviewsTable();
   app.listen(port, () => {
     console.log(`Prisma Estudos API rodando na porta ${port}`);
   });
+}
+
+async function ensureStudyReviewsTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS study_reviews (
+        id               VARCHAR(40)  PRIMARY KEY,
+        user_id          VARCHAR(40)  NOT NULL,
+        title            VARCHAR(255) NOT NULL,
+        subject          VARCHAR(120),
+        topic            VARCHAR(180),
+        reviewed_at      DATE,
+        next_review_date DATE,
+        status           ENUM('pendente','concluida','encerrada') NOT NULL DEFAULT 'pendente',
+        difficulty       ENUM('facil','medio','dificil'),
+        notes            TEXT,
+        created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        INDEX idx_sr_user_status      (user_id, status),
+        INDEX idx_sr_user_next_review (user_id, next_review_date)
+      )
+    `);
+    console.log("Tabela study_reviews verificada/criada.");
+  } catch (error) {
+    console.error("Erro ao criar tabela study_reviews:", error.message);
+  }
 }
 
 async function ensureRequiredAdmins() {

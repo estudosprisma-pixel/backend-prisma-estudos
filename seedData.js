@@ -14,9 +14,13 @@ const technicianContest = editalCatalog.contests.find((contest) => contest.id ==
 const seedState = {
   currentUserId: null,
   users: [
-    { id: "u-admin-nat", name: "Nat", email: "nat@prismaestudos.local", passwordHash: "$2a$10$EHAVS.bdlgsqtP2.snvYhOBqysLpH6sXYR/4yw2CswXHValZNJCcu", role: "admin", status: "active", accessExpiresAt: null },
-    { id: "u-admin-joao-guilherme", name: "João Guilherme", email: "joao.guilherme@prismaestudos.local", passwordHash: "$2a$10$HV4JHhtoA1peSwCm2n0Bm.jzJ.HBq/IAUcNd6YIl0D82SXrma27mG", role: "admin", status: "active", accessExpiresAt: null },
-    { id: "u-admin", name: "Marina Admin", email: "admin@prismaestudos.local", password: "admin123", role: "admin", status: "active", accessExpiresAt: null },
+    // Senhas via env var: os hashes bcrypt antigos nao podem ser reaproveitados no Supabase Auth
+    // (ele guarda e verifica a propria senha). Defina ADMIN_NAT_PASSWORD/ADMIN_JOAO_PASSWORD/
+    // ADMIN_PASSWORD antes de rodar `npm run seed` em qualquer ambiente real; os defaults abaixo
+    // sao so para desenvolvimento local.
+    { id: "u-admin-nat", name: "Nat", email: "nat@prismaestudos.local", password: process.env.ADMIN_NAT_PASSWORD || "dev-only-change-me-nat", role: "admin", status: "active", accessExpiresAt: null },
+    { id: "u-admin-joao-guilherme", name: "João Guilherme", email: "joao.guilherme@prismaestudos.local", password: process.env.ADMIN_JOAO_PASSWORD || "dev-only-change-me-joao", role: "admin", status: "active", accessExpiresAt: null },
+    { id: "u-admin", name: "Marina Admin", email: "admin@prismaestudos.local", password: process.env.ADMIN_PASSWORD || "admin123", role: "admin", status: "active", accessExpiresAt: null },
     { id: "u-ana", name: "Ana Ribeiro", email: "ana@prismaestudos.local", password: "123456", role: "student", status: "active", accessExpiresAt: addDaysISO(30) },
     { id: "u-lucas", name: "Lucas Lima", email: "lucas@prismaestudos.local", password: "123456", role: "student", status: "active", accessExpiresAt: addDaysISO(7) }
   ],

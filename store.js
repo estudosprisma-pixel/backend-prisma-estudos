@@ -1,18 +1,16 @@
-const bcrypt = require("bcryptjs");
-const crypto = require("crypto");
 const { pool } = require("./db");
 const { bool, dateOnly, dateTimeFor, fromDbStatus, toDbStatus } = require("./stateMapper");
 
 async function readStateFromDb() {
-  const [users] = await pool.query("SELECT id, name, email, role, status, access_expires_at FROM users ORDER BY created_at, id");
-  const [profiles] = await pool.query("SELECT * FROM study_profiles");
-  const [subjects] = await pool.query("SELECT * FROM subjects ORDER BY created_at, id");
-  const [topics] = await pool.query("SELECT * FROM topics ORDER BY topic_order, id");
-  const [userSubjects] = await pool.query("SELECT user_id, subject_id FROM user_subjects ORDER BY selected_at, subject_id");
-  const [userTopics] = await pool.query("SELECT * FROM user_topics");
-  const [sessions] = await pool.query("SELECT * FROM study_sessions ORDER BY started_at, id");
-  const [reviews] = await pool.query("SELECT * FROM reviews ORDER BY due_date, id");
-  const themes = await readOptionalTable("user_theme_settings", "SELECT * FROM user_theme_settings");
+  const { rows: users } = await pool.query("SELECT id, name, email, role, status, access_expires_at FROM users ORDER BY created_at, id");
+  const { rows: profiles } = await pool.query("SELECT * FROM study_profiles");
+  const { rows: subjects } = await pool.query("SELECT * FROM subjects ORDER BY created_at, id");
+  const { rows: topics } = await pool.query("SELECT * FROM topics ORDER BY topic_order, id");
+  const { rows: userSubjects } = await pool.query("SELECT user_id, subject_id FROM user_subjects ORDER BY selected_at, subject_id");
+  const { rows: userTopics } = await pool.query("SELECT * FROM user_topics");
+  const { rows: sessions } = await pool.query("SELECT * FROM study_sessions ORDER BY started_at, id");
+  const { rows: reviews } = await pool.query("SELECT * FROM reviews ORDER BY due_date, id");
+  const { rows: themes } = await pool.query("SELECT * FROM user_theme_settings");
 
   const state = {
     currentUserId: null,
@@ -105,9 +103,9 @@ async function readStateFromDb() {
       status: fromDbStatus(row.status),
       progress: row.progress_percent,
       unlocked: Boolean(row.unlocked),
-      ...("theory_read" in row ? { theoryRead: Boolean(row.theory_read) } : {}),
-      ...("summary_done" in row ? { summaryDone: Boolean(row.summary_done) } : {}),
-      ...("exercises_done" in row ? { exercisesDone: Boolean(row.exercises_done) } : {}),
+      theoryRead: Boolean(row.theory_read),
+      summaryDone: Boolean(row.summary_done),
+      exercisesDone: Boolean(row.exercises_done),
       completedAt: dateOnly(row.completed_at)
     };
   });
@@ -126,10 +124,13 @@ async function readStateFromDb() {
   return state;
 }
 
+// Importante: quem cria/apaga usuarios no Supabase Auth e remapeia ids temporarios para uuids
+// reais e o server.js (rota PUT /api/state), antes de chamar esta funcao. Aqui assumimos que
+// todo item de state.users ja tem um id que existe em auth.users/public.users.
 async function saveStateToDb(state) {
-  const connection = await pool.getConnection();
+  const client = await pool.connect();
   try {
-    await connection.beginTransaction();
+    await client.query("BEGIN");
     const validUserIds = new Set((state.users || []).map((user) => user.id));
     const validSubjects = (state.subjects || []).filter((subject) => subject?.id);
     const validSubjectIds = new Set(validSubjects.map((subject) => subject.id));
@@ -139,36 +140,29 @@ async function saveStateToDb(state) {
       return valid;
     });
     const validTopicIds = new Set(validTopics.map((topic) => topic.id));
-    const [existingUsers] = await connection.query("SELECT id, password_hash FROM users");
-    const passwordHashes = new Map(existingUsers.map((user) => [user.id, user.password_hash]));
-    await connection.query("DELETE FROM reviews");
-    await connection.query("DELETE FROM study_sessions");
-    await connection.query("DELETE FROM user_topics");
-    await connection.query("DELETE FROM user_subjects");
-    const hasThemeSettings = await tableExists(connection, "user_theme_settings");
-    if (hasThemeSettings) await connection.query("DELETE FROM user_theme_settings");
-    await connection.query("DELETE FROM study_profiles");
-    await connection.query("DELETE FROM topics");
-    await connection.query("DELETE FROM subjects");
-    await connection.query("DELETE FROM users");
+
+    await client.query("DELETE FROM reviews");
+    await client.query("DELETE FROM study_sessions");
+    await client.query("DELETE FROM user_topics");
+    await client.query("DELETE FROM user_subjects");
+    await client.query("DELETE FROM user_theme_settings");
+    await client.query("DELETE FROM study_profiles");
+    await client.query("DELETE FROM topics");
+    await client.query("DELETE FROM subjects");
+    await client.query("DELETE FROM users");
 
     for (const user of state.users || []) {
-      const passwordHash = user.password
-        ? await bcrypt.hash(user.password, 10)
-        : user.passwordHash
-          ? user.passwordHash
-        : passwordHashes.get(user.id) || await bcrypt.hash(crypto.randomUUID(), 10);
-      await connection.query(
-        `INSERT INTO users (id, name, email, password_hash, role, status, access_expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [user.id, user.name, user.email, passwordHash, user.role || "student", user.status || "active", user.accessExpiresAt || null]
+      await client.query(
+        `INSERT INTO users (id, name, email, role, status, access_expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [user.id, user.name, user.email, user.role || "student", user.status || "active", user.accessExpiresAt || null]
       );
     }
 
     for (const subject of validSubjects) {
-      await connection.query(
+      await client.query(
         `INSERT INTO subjects (id, name, color, is_base, owner_user_id, created_by_admin_id)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+         VALUES ($1, $2, $3, $4, $5, $6)`,
         [
           subject.id,
           subject.name,
@@ -181,9 +175,9 @@ async function saveStateToDb(state) {
     }
 
     for (const topic of validTopics) {
-      await connection.query(
+      await client.query(
         `INSERT INTO topics (id, subject_id, title, topic_order, suggested_minutes, is_base, owner_user_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [
           topic.id,
           topic.subjectId,
@@ -198,10 +192,10 @@ async function saveStateToDb(state) {
 
     for (const [userId, profile] of Object.entries(state.profiles || {})) {
       if (!(state.users || []).some((user) => user.id === userId)) continue;
-      await connection.query(
+      await client.query(
         `INSERT INTO study_profiles
           (id, user_id, objective, education_context, daily_minutes, available_days, preferred_time, current_level, review_preference, topics_per_day, mix_subjects, profile_configured, onboarding_completed)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
         [
           `sp-${userId}`,
           userId,
@@ -230,12 +224,13 @@ async function saveStateToDb(state) {
           console.warn("Ignorando user_subject sem materia correspondente ao salvar estado", { userId, subjectId });
           continue;
         }
-        await connection.query("INSERT IGNORE INTO user_subjects (user_id, subject_id) VALUES (?, ?)", [userId, subjectId]);
+        await client.query(
+          "INSERT INTO user_subjects (user_id, subject_id) VALUES ($1, $2) ON CONFLICT (user_id, subject_id) DO NOTHING",
+          [userId, subjectId]
+        );
       }
     }
 
-    const userTopicColumns = await tableColumns(connection, "user_topics");
-    const hasTopicChecklistColumns = ["theory_read", "summary_done", "exercises_done"].every((column) => userTopicColumns.has(column));
     for (const [userId, topics] of Object.entries(state.userTopics || {})) {
       if (!validUserIds.has(userId)) {
         console.warn("Ignorando topicos de usuario inexistente ao salvar estado", { userId });
@@ -246,30 +241,22 @@ async function saveStateToDb(state) {
           console.warn("Ignorando user_topic sem topico correspondente ao salvar estado", { userId, topicId });
           continue;
         }
-        if (hasTopicChecklistColumns) {
-          await connection.query(
-            `INSERT INTO user_topics
-              (user_id, topic_id, status, progress_percent, unlocked, theory_read, summary_done, exercises_done, completed_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              userId,
-              topicId,
-              toDbStatus(topicState.status),
-              Number(topicState.progress || 0),
-              bool(topicState.unlocked),
-              bool(topicState.theoryRead),
-              bool(topicState.summaryDone),
-              bool(topicState.exercisesDone),
-              topicState.completedAt || null
-            ]
-          );
-        } else {
-          await connection.query(
-            `INSERT INTO user_topics (user_id, topic_id, status, progress_percent, unlocked, completed_at)
-             VALUES (?, ?, ?, ?, ?, ?)`,
-            [userId, topicId, toDbStatus(topicState.status), Number(topicState.progress || 0), bool(topicState.unlocked), topicState.completedAt || null]
-          );
-        }
+        await client.query(
+          `INSERT INTO user_topics
+            (user_id, topic_id, status, progress_percent, unlocked, theory_read, summary_done, exercises_done, completed_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [
+            userId,
+            topicId,
+            toDbStatus(topicState.status),
+            Number(topicState.progress || 0),
+            bool(topicState.unlocked),
+            bool(topicState.theoryRead),
+            bool(topicState.summaryDone),
+            bool(topicState.exercisesDone),
+            topicState.completedAt || null
+          ]
+        );
       }
     }
 
@@ -283,10 +270,10 @@ async function saveStateToDb(state) {
         });
         continue;
       }
-      await connection.query(
+      await client.query(
         `INSERT INTO study_sessions
           (id, user_id, subject_id, topic_id, started_at, finished_at, planned_minutes, studied_minutes, result, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
         [
           session.id,
           session.userId,
@@ -312,10 +299,10 @@ async function saveStateToDb(state) {
         });
         continue;
       }
-      await connection.query(
+      await client.query(
         `INSERT INTO reviews
           (id, user_id, subject_id, topic_id, original_study_date, due_date, review_count, status, completed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
         [
           review.id,
           review.userId,
@@ -330,54 +317,36 @@ async function saveStateToDb(state) {
       );
     }
 
-    if (hasThemeSettings) {
-      for (const [userId, theme] of Object.entries(state.themes || {})) {
-        await connection.query(
-          `INSERT INTO user_theme_settings
-            (user_id, theme_mode, primary_color, secondary_color, card_style, banner_url, density)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [
-            userId,
-            theme.mode || "dark",
-            theme.primary || "#22d3ee",
-            theme.secondary || "#8b5cf6",
-            theme.cardStyle || "soft",
-            theme.banner || null,
-            theme.density || "normal"
-          ]
-        );
-      }
+    for (const [userId, theme] of Object.entries(state.themes || {})) {
+      if (!validUserIds.has(userId)) continue;
+      await client.query(
+        `INSERT INTO user_theme_settings
+          (user_id, theme_mode, primary_color, secondary_color, card_style, banner_url, density)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          userId,
+          theme.mode || "dark",
+          theme.primary || "#22d3ee",
+          theme.secondary || "#8b5cf6",
+          theme.cardStyle || "soft",
+          theme.banner || null,
+          theme.density || "normal"
+        ]
+      );
     }
 
-    await connection.commit();
+    await client.query("COMMIT");
   } catch (error) {
-    await connection.rollback();
+    await client.query("ROLLBACK");
     throw error;
   } finally {
-    connection.release();
+    client.release();
   }
 }
 
 async function hasUsers() {
-  const [[row]] = await pool.query("SELECT COUNT(*) AS total FROM users");
-  return row.total > 0;
-}
-
-async function readOptionalTable(tableName, query) {
-  if (!(await tableExists(pool, tableName))) return [];
-  const [rows] = await pool.query(query);
-  return rows;
-}
-
-async function tableExists(executor, tableName) {
-  const [rows] = await executor.query("SHOW TABLES LIKE ?", [tableName]);
-  return rows.length > 0;
-}
-
-async function tableColumns(executor, tableName) {
-  if (!(await tableExists(executor, tableName))) return new Set();
-  const [rows] = await executor.query(`SHOW COLUMNS FROM ${tableName}`);
-  return new Set(rows.map((row) => row.Field));
+  const { rows } = await pool.query("SELECT COUNT(*) AS total FROM users");
+  return Number(rows[0].total) > 0;
 }
 
 function parseJson(value, fallback) {

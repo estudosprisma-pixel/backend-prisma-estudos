@@ -2,17 +2,16 @@ require("dotenv").config();
 
 const path = require("path");
 const crypto = require("crypto");
-const bcrypt = require("bcryptjs");
 const cors = require("cors");
 const express = require("express");
-const jwt = require("jsonwebtoken");
 const { dbConfig, pool } = require("./db");
+const { supabaseAdmin, supabaseAuth } = require("./supabaseClient");
+const { ensureSupabaseUser, remapUserIds, provisionSeedState } = require("./authProvisioning");
 const { hasUsers, readStateFromDb, saveStateToDb } = require("./store");
 const { seedState } = require("./seedData");
 
 const app = express();
 const port = Number(process.env.PORT || 3001);
-const jwtSecret = process.env.JWT_SECRET || "dev-only-change-me";
 const isProduction = process.env.NODE_ENV === "production";
 const authCookieName = "prisma_estudos_session";
 const defaultAllowedOrigins = [
@@ -31,10 +30,6 @@ const loginAliases = {
   joao: "joao.guilherme@prismaestudos.local",
   admin: "admin@prismaestudos.local"
 };
-
-if (isProduction && jwtSecret === "dev-only-change-me") {
-  throw new Error("JWT_SECRET precisa ser configurado em producao.");
-}
 
 app.disable("x-powered-by");
 app.use((_, res, next) => {
@@ -64,7 +59,7 @@ app.get("/api/health", async (_req, res) => {
   res.json({
     ok: true,
     service: "Prisma Estudos API",
-    database: dbConfig.database,
+    database: dbConfig.database || "supabase",
     environment: process.env.NODE_ENV || "development"
   });
 });
@@ -75,7 +70,14 @@ app.post("/api/auth/login", async (req, res) => {
   if (!login || !password) return res.status(400).json({ message: "Informe usuario ou email e senha." });
   if (isRateLimited(req, login)) return res.status(429).json({ message: "Muitas tentativas. Aguarde alguns minutos e tente novamente." });
 
-  const [[user]] = await pool.query("SELECT * FROM users WHERE email = ? LIMIT 1", [login]);
+  const { data: authData, error: authError } = await supabaseAuth.auth.signInWithPassword({ email: login, password });
+  if (authError || !authData?.session) {
+    registerFailedLogin(req, login);
+    return res.status(401).json({ message: "Login ou senha invalidos." });
+  }
+
+  const { rows } = await pool.query("SELECT * FROM users WHERE id = $1 LIMIT 1", [authData.user.id]);
+  const user = rows[0];
   if (!user) {
     registerFailedLogin(req, login);
     return res.status(401).json({ message: "Login ou senha invalidos." });
@@ -89,15 +91,8 @@ app.post("/api/auth/login", async (req, res) => {
     return res.status(403).json({ message: "Seu acesso expirou. Renove sua assinatura para continuar usando o Prisma Estudos." });
   }
 
-  const valid = await bcrypt.compare(password, user.password_hash);
-  if (!valid) {
-    registerFailedLogin(req, login);
-    return res.status(401).json({ message: "Login ou senha invalidos." });
-  }
-
-  const token = jwt.sign({ sub: user.id, role: user.role }, jwtSecret, { expiresIn: "8h" });
   clearFailedLogin(req, login);
-  res.setHeader("Set-Cookie", buildAuthCookie(token));
+  res.setHeader("Set-Cookie", buildAuthCookie(authData.session.access_token, authData.session.expires_in));
   const state = filterStateForUser(await readStateFromDb(), publicUser(user));
   state.currentUserId = user.id;
   state.route = user.role === "admin" ? "admin" : "dashboard";
@@ -118,17 +113,15 @@ app.post("/api/auth/register", async (req, res) => {
     return res.status(400).json({ message: "Preencha nome e uma senha com pelo menos 6 caracteres." });
   }
 
-  const userId = `u-${crypto.randomUUID()}`;
-  const passwordHash = await bcrypt.hash(password, 10);
-
-  const connection = await pool.getConnection();
+  const client = await pool.connect();
+  let createdAuthUserId = null;
   try {
-    await connection.beginTransaction();
-    const tokenRow = await getPaymentTokenRecord(connection, paymentToken, { lock: true });
+    await client.query("BEGIN");
+    const tokenRow = await getPaymentTokenRecord(client, paymentToken, { lock: true });
     const tokenStatus = describePaymentTokenStatus(tokenRow);
 
     if (!tokenStatus.valid) {
-      await connection.rollback();
+      await client.query("ROLLBACK");
       return res.status(400).json({ message: "Link invalido, expirado ou ja utilizado." });
     }
 
@@ -138,76 +131,76 @@ app.post("/api/auth/register", async (req, res) => {
     const finalEmail = tokenEmail || email;
 
     if (!finalEmail) {
-      await connection.rollback();
+      await client.query("ROLLBACK");
       return res.status(400).json({ message: "Nao foi possivel identificar o e-mail vinculado a compra." });
     }
 
     if (tokenEmail && email && tokenEmail !== email) {
-      await connection.rollback();
+      await client.query("ROLLBACK");
       return res.status(400).json({ message: "Use o e-mail vinculado a compra para concluir o cadastro." });
     }
 
-    const [[existingUser]] = await connection.query("SELECT id FROM users WHERE email = ? LIMIT 1", [finalEmail]);
-    if (existingUser) {
-      await connection.rollback();
+    const { rows: existingRows } = await client.query("SELECT id FROM users WHERE email = $1 LIMIT 1", [finalEmail]);
+    if (existingRows[0]) {
+      await client.query("ROLLBACK");
       return res.status(409).json({ message: "Ja existe uma conta com este e-mail. Faca login para continuar." });
     }
 
+    const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+      email: finalEmail,
+      password,
+      email_confirm: true
+    });
+    if (authError || !authData?.user) {
+      await client.query("ROLLBACK");
+      throw new Error(authError?.message || "Falha ao criar usuario no Supabase Auth.");
+    }
+    createdAuthUserId = authData.user.id;
+    const userId = authData.user.id;
+
     const accessExpiresAt = addDaysToToday(durationDays);
-    await connection.query(
-      `INSERT INTO users (id, name, email, password_hash, role, status, access_expires_at)
-       VALUES (?, ?, ?, ?, 'student', 'active', ?)`,
-      [userId, name, finalEmail, passwordHash, accessExpiresAt]
+    await client.query(
+      `INSERT INTO users (id, name, email, role, status, access_expires_at)
+       VALUES ($1, $2, $3, 'student', 'active', $4)`,
+      [userId, name, finalEmail, accessExpiresAt]
     );
-    await connection.query(
+    await client.query(
       `INSERT INTO study_profiles
         (id, user_id, objective, education_context, daily_minutes, available_days, preferred_time, current_level, review_preference, topics_per_day, mix_subjects, profile_configured, onboarding_completed)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        `sp-${userId}`,
-        userId,
-        "",
-        "",
-        60,
-        JSON.stringify(["Seg", "Ter", "Qua", "Qui", "Sex"]),
-        "19:00",
-        "iniciante",
-        "semanal",
-        2,
-        1,
-        0,
-        0
-      ]
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      [`sp-${userId}`, userId, "", "", 60, JSON.stringify(["Seg", "Ter", "Qua", "Qui", "Sex"]), "19:00", "iniciante", "semanal", 2, true, false, false]
     );
 
-    const [tokenUpdate] = await connection.query(
+    const tokenUpdate = await client.query(
       `UPDATE payment_tokens
-       SET used = 1,
-           used_by_user_id = ?,
-           used_at = NOW()
-       WHERE token = ?
-         AND used = 0`,
+       SET used = true,
+           used_by_user_id = $1,
+           used_at = now()
+       WHERE token = $2
+         AND used = false`,
       [userId, paymentToken]
     );
 
-    if (tokenUpdate.affectedRows !== 1) {
+    if (tokenUpdate.rowCount !== 1) {
       throw new Error("Nao foi possivel marcar o token como utilizado.");
     }
 
-    await connection.commit();
+    await client.query("COMMIT");
 
-    const [[user]] = await pool.query("SELECT * FROM users WHERE id = ? LIMIT 1", [userId]);
-    const token = jwt.sign({ sub: user.id, role: user.role }, jwtSecret, { expiresIn: "8h" });
-    res.setHeader("Set-Cookie", buildAuthCookie(token));
+    const { rows: userRows } = await pool.query("SELECT * FROM users WHERE id = $1 LIMIT 1", [userId]);
+    const user = userRows[0];
+    const session = await createSessionForUser(finalEmail, password);
+    res.setHeader("Set-Cookie", buildAuthCookie(session.access_token, session.expires_in));
     const state = filterStateForUser(await readStateFromDb(), publicUser(user));
     state.currentUserId = user.id;
     state.route = "profile";
     return res.status(201).json({ user: publicUser(user), state, plan });
   } catch (error) {
-    await connection.rollback();
+    await client.query("ROLLBACK").catch(() => {});
+    if (createdAuthUserId) await supabaseAdmin.auth.admin.deleteUser(createdAuthUserId).catch(() => {});
     throw error;
   } finally {
-    connection.release();
+    client.release();
   }
 });
 
@@ -259,20 +252,11 @@ app.post("/api/webhooks/cakto", async (req, res) => {
       });
     }
 
-    const paymentTokenColumns = await readPaymentTokenColumns();
-    if (!paymentTokenColumns.has("transaction_id")) {
-      console.error("Tabela payment_tokens sem coluna transaction_id");
-      return res.status(200).json({
-        ok: false,
-        ignored: true,
-        message: "Tabela payment_tokens sem coluna transaction_id."
-      });
-    }
-
-    const [[existingToken]] = await pool.query(
-      "SELECT token, customer_email, plan, transaction_id FROM payment_tokens WHERE transaction_id = ? LIMIT 1",
+    const { rows: existingRows } = await pool.query(
+      "SELECT token, customer_email, plan, transaction_id FROM payment_tokens WHERE transaction_id = $1 LIMIT 1",
       [transactionId]
     );
+    const existingToken = existingRows[0];
 
     if (existingToken) {
       return res.status(200).json({ ok: true, duplicate: true, token: existingToken.token });
@@ -281,19 +265,20 @@ app.post("/api/webhooks/cakto", async (req, res) => {
     const token = generateSecureToken();
     console.log("criando token");
 
-    const [insertResult] = await pool.query(
-      `INSERT IGNORE INTO payment_tokens
+    const insertResult = await pool.query(
+      `INSERT INTO payment_tokens
         (token, plan, duration_days, customer_email, transaction_id, status, used, created_at)
-       VALUES (?, ?, ?, ?, ?, 'active', 0, NOW())`,
+       VALUES ($1, $2, $3, $4, $5, 'active', false, now())
+       ON CONFLICT (transaction_id) DO NOTHING`,
       [token, plan, durationDays, email, transactionId]
     );
 
-    if (!insertResult.affectedRows) {
-      const [[duplicatedRow]] = await pool.query(
-        "SELECT token FROM payment_tokens WHERE transaction_id = ? LIMIT 1",
+    if (!insertResult.rowCount) {
+      const { rows: duplicatedRows } = await pool.query(
+        "SELECT token FROM payment_tokens WHERE transaction_id = $1 LIMIT 1",
         [transactionId]
       );
-      return res.status(200).json({ ok: true, duplicate: true, token: duplicatedRow?.token || null });
+      return res.status(200).json({ ok: true, duplicate: true, token: duplicatedRows[0]?.token || null });
     }
 
     console.log("token criado", token);
@@ -342,6 +327,9 @@ app.put("/api/state", requireAuth, async (req, res) => {
     const incoming = req.body?.state;
     if (!incoming || !Array.isArray(incoming.users)) return res.status(400).json({ message: "Estado invalido." });
     incoming.currentUserId = req.user.id;
+    if (req.user.role === "admin") {
+      await provisionUsersForSupabaseAuth(incoming);
+    }
     const stateToSave = req.user.role === "admin" ? incoming : mergeStudentState(await readStateFromDb(), incoming, req.user.id);
     await saveStateToDb(stateToSave);
     const state = filterStateForUser(await readStateFromDb(), req.user);
@@ -352,8 +340,7 @@ app.put("/api/state", requireAuth, async (req, res) => {
     console.error("Erro ao salvar estado do usuario", {
       userId: req.user?.id,
       code: error.code,
-      message: error.message,
-      sqlMessage: error.sqlMessage
+      message: error.message
     });
     res.status(500).json({ message: "Erro ao salvar estado." });
   }
@@ -361,6 +348,7 @@ app.put("/api/state", requireAuth, async (req, res) => {
 
 app.post("/api/dev/seed", async (_req, res) => {
   if (process.env.NODE_ENV === "production") return res.status(403).json({ message: "Seed desativado em producao." });
+  await provisionSeedState(seedState);
   await saveStateToDb(seedState);
   res.json({ ok: true });
 });
@@ -369,11 +357,11 @@ app.post("/api/dev/seed", async (_req, res) => {
 
 app.get("/api/reviews/today", requireAuth, async (req, res) => {
   const today = new Date().toISOString().slice(0, 10);
-  const [rows] = await pool.query(
+  const { rows } = await pool.query(
     `SELECT * FROM study_reviews
-     WHERE user_id = ?
+     WHERE user_id = $1
        AND status = 'pendente'
-       AND (next_review_date IS NULL OR next_review_date <= ?)
+       AND (next_review_date IS NULL OR next_review_date <= $2)
      ORDER BY next_review_date ASC, created_at ASC`,
     [req.user.id, today]
   );
@@ -381,8 +369,8 @@ app.get("/api/reviews/today", requireAuth, async (req, res) => {
 });
 
 app.get("/api/reviews", requireAuth, async (req, res) => {
-  const [rows] = await pool.query(
-    "SELECT * FROM study_reviews WHERE user_id = ? ORDER BY created_at DESC",
+  const { rows } = await pool.query(
+    "SELECT * FROM study_reviews WHERE user_id = $1 ORDER BY created_at DESC",
     [req.user.id]
   );
   res.json({ reviews: rows.map(mapReviewRow) });
@@ -400,66 +388,66 @@ app.post("/api/reviews", requireAuth, async (req, res) => {
   await pool.query(
     `INSERT INTO study_reviews
       (id, user_id, title, subject, topic, reviewed_at, next_review_date, status, difficulty, notes)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'pendente', ?, ?)`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pendente', $8, $9)`,
     [id, req.user.id, String(title).trim(), subject || null, topic || null,
      today, nextDate, difficulty || null, notes || null]
   );
-  const [[row]] = await pool.query("SELECT * FROM study_reviews WHERE id = ?", [id]);
-  res.status(201).json({ review: mapReviewRow(row) });
+  const { rows } = await pool.query("SELECT * FROM study_reviews WHERE id = $1", [id]);
+  res.status(201).json({ review: mapReviewRow(rows[0]) });
 });
 
 app.patch("/api/reviews/:id", requireAuth, async (req, res) => {
-  const [[existing]] = await pool.query(
-    "SELECT id, difficulty FROM study_reviews WHERE id = ? AND user_id = ?",
+  const { rows: existingRows } = await pool.query(
+    "SELECT id, difficulty FROM study_reviews WHERE id = $1 AND user_id = $2",
     [req.params.id, req.user.id]
   );
+  const existing = existingRows[0];
   if (!existing) return res.status(404).json({ message: "Revisao nao encontrada." });
 
   const { title, subject, topic, difficulty, notes, status, next_review_date } = req.body || {};
   const fields = [];
   const values = [];
 
-  if (title !== undefined) { fields.push("title = ?"); values.push(String(title).trim()); }
-  if (subject !== undefined) { fields.push("subject = ?"); values.push(subject || null); }
-  if (topic !== undefined) { fields.push("topic = ?"); values.push(topic || null); }
-  if (difficulty !== undefined) { fields.push("difficulty = ?"); values.push(difficulty || null); }
-  if (notes !== undefined) { fields.push("notes = ?"); values.push(notes || null); }
-  if (status !== undefined) { fields.push("status = ?"); values.push(status); }
+  if (title !== undefined) { fields.push(`title = $${fields.length + 1}`); values.push(String(title).trim()); }
+  if (subject !== undefined) { fields.push(`subject = $${fields.length + 1}`); values.push(subject || null); }
+  if (topic !== undefined) { fields.push(`topic = $${fields.length + 1}`); values.push(topic || null); }
+  if (difficulty !== undefined) { fields.push(`difficulty = $${fields.length + 1}`); values.push(difficulty || null); }
+  if (notes !== undefined) { fields.push(`notes = $${fields.length + 1}`); values.push(notes || null); }
+  if (status !== undefined) { fields.push(`status = $${fields.length + 1}`); values.push(status); }
 
   if (next_review_date !== undefined) {
-    fields.push("next_review_date = ?");
+    fields.push(`next_review_date = $${fields.length + 1}`);
     values.push(next_review_date || null);
   } else if (status === "concluida") {
     const dayMap = { facil: 7, medio: 3, dificil: 1 };
     const eff = difficulty || existing.difficulty;
-    fields.push("next_review_date = ?");
+    fields.push(`next_review_date = $${fields.length + 1}`);
     values.push(addDaysToToday(dayMap[eff] ?? 3));
   }
 
   if (status === "concluida") {
-    fields.push("reviewed_at = ?");
+    fields.push("reviewed_at = " + `$${fields.length + 1}`);
     values.push(new Date().toISOString().slice(0, 10));
   }
 
   if (fields.length) {
-    fields.push("updated_at = NOW()");
     values.push(req.params.id, req.user.id);
     await pool.query(
-      `UPDATE study_reviews SET ${fields.join(", ")} WHERE id = ? AND user_id = ?`,
+      `UPDATE study_reviews SET ${fields.join(", ")}, updated_at = now() WHERE id = $${values.length - 1} AND user_id = $${values.length}`,
       values
     );
   }
 
-  const [[updated]] = await pool.query("SELECT * FROM study_reviews WHERE id = ?", [req.params.id]);
-  res.json({ review: mapReviewRow(updated) });
+  const { rows: updatedRows } = await pool.query("SELECT * FROM study_reviews WHERE id = $1", [req.params.id]);
+  res.json({ review: mapReviewRow(updatedRows[0]) });
 });
 
 app.delete("/api/reviews/:id", requireAuth, async (req, res) => {
-  const [result] = await pool.query(
-    "DELETE FROM study_reviews WHERE id = ? AND user_id = ?",
+  const result = await pool.query(
+    "DELETE FROM study_reviews WHERE id = $1 AND user_id = $2",
     [req.params.id, req.user.id]
   );
-  if (!result.affectedRows) return res.status(404).json({ message: "Revisao nao encontrada." });
+  if (!result.rowCount) return res.status(404).json({ message: "Revisao nao encontrada." });
   res.json({ ok: true });
 });
 
@@ -509,9 +497,9 @@ function mapPrefRow(row) {
 }
 
 app.get("/api/preferences", requireAuth, async (req, res) => {
-  const [[row]] = await pool.query("SELECT * FROM user_preferences WHERE user_id = ? LIMIT 1", [req.user.id]);
-  if (!row) return res.json({ preferences: { ...DEFAULT_PREFERENCES } });
-  res.json({ preferences: mapPrefRow(row) });
+  const { rows } = await pool.query("SELECT * FROM user_preferences WHERE user_id = $1 LIMIT 1", [req.user.id]);
+  if (!rows[0]) return res.json({ preferences: { ...DEFAULT_PREFERENCES } });
+  res.json({ preferences: mapPrefRow(rows[0]) });
 });
 
 app.put("/api/preferences", requireAuth, async (req, res) => {
@@ -520,17 +508,17 @@ app.put("/api/preferences", requireAuth, async (req, res) => {
   const subjects = Array.isArray(preferredSubjects) ? JSON.stringify(preferredSubjects) : "[]";
   await pool.query(
     `INSERT INTO user_preferences (id, user_id, theme, accent_color, study_goal, daily_study_minutes, preferred_subjects, notifications_enabled, sound_enabled, layout_mode)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE
-       theme = VALUES(theme),
-       accent_color = VALUES(accent_color),
-       study_goal = VALUES(study_goal),
-       daily_study_minutes = VALUES(daily_study_minutes),
-       preferred_subjects = VALUES(preferred_subjects),
-       notifications_enabled = VALUES(notifications_enabled),
-       sound_enabled = VALUES(sound_enabled),
-       layout_mode = VALUES(layout_mode),
-       updated_at = NOW()`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT (user_id) DO UPDATE SET
+       theme = EXCLUDED.theme,
+       accent_color = EXCLUDED.accent_color,
+       study_goal = EXCLUDED.study_goal,
+       daily_study_minutes = EXCLUDED.daily_study_minutes,
+       preferred_subjects = EXCLUDED.preferred_subjects,
+       notifications_enabled = EXCLUDED.notifications_enabled,
+       sound_enabled = EXCLUDED.sound_enabled,
+       layout_mode = EXCLUDED.layout_mode,
+       updated_at = now()`,
     [
       id, req.user.id,
       theme || "dark",
@@ -538,13 +526,13 @@ app.put("/api/preferences", requireAuth, async (req, res) => {
       studyGoal || "",
       Number(dailyStudyMinutes || 60),
       subjects,
-      notificationsEnabled !== false ? 1 : 0,
-      soundEnabled !== false ? 1 : 0,
+      notificationsEnabled !== false,
+      soundEnabled !== false,
       layoutMode || "default"
     ]
   );
-  const [[row]] = await pool.query("SELECT * FROM user_preferences WHERE user_id = ?", [req.user.id]);
-  res.json({ preferences: mapPrefRow(row) });
+  const { rows } = await pool.query("SELECT * FROM user_preferences WHERE user_id = $1", [req.user.id]);
+  res.json({ preferences: mapPrefRow(rows[0]) });
 });
 
 // ── Error handler ─────────────────────────────────────────────────────────────
@@ -559,8 +547,10 @@ async function requireAuth(req, res, next) {
   try {
     const token = req.headers.authorization?.replace(/^Bearer\s+/i, "") || readCookie(req, authCookieName);
     if (!token) return res.status(401).json({ message: "Sessao expirada." });
-    const payload = jwt.verify(token, jwtSecret);
-    const [[user]] = await pool.query("SELECT id, name, email, role, status, access_expires_at FROM users WHERE id = ? AND status = 'active'", [payload.sub]);
+    const { data, error } = await supabaseAuth.auth.getUser(token);
+    if (error || !data?.user) return res.status(401).json({ message: "Sessao expirada." });
+    const { rows } = await pool.query("SELECT id, name, email, role, status, access_expires_at FROM users WHERE id = $1 AND status = 'active'", [data.user.id]);
+    const user = rows[0];
     if (!user) return res.status(401).json({ message: "Usuario nao encontrado." });
     if (!isAccessActive(user)) return res.status(403).json({ message: "Acesso expirado." });
     req.user = user;
@@ -568,6 +558,47 @@ async function requireAuth(req, res, next) {
   } catch {
     res.status(401).json({ message: "Sessao expirada." });
   }
+}
+
+// Cria/atualiza no Supabase Auth cada usuario do state que veio com uma senha em texto plano
+// (fluxo de criar/editar usuario no painel admin), remapeando o id temporario gerado no
+// frontend para o uuid real, e remove do Supabase Auth quem foi excluido no admin.
+async function provisionUsersForSupabaseAuth(incoming) {
+  const usersWithPassword = (incoming.users || []).filter((user) => user.password);
+  const { rows: currentUsers } = await pool.query("SELECT id FROM users");
+  const currentUserIds = new Set(currentUsers.map((row) => row.id));
+  const idMap = new Map();
+
+  for (const user of usersWithPassword) {
+    if (currentUserIds.has(user.id)) {
+      const { error } = await supabaseAdmin.auth.admin.updateUserById(user.id, { password: user.password });
+      if (error) throw new Error(`Falha ao atualizar senha do usuario ${user.email}: ${error.message}`);
+    } else {
+      const realId = await ensureSupabaseUser(user.email, user.password);
+      idMap.set(user.id, realId);
+      user.id = realId;
+    }
+  }
+
+  (incoming.users || []).forEach((user) => {
+    delete user.password;
+    delete user.passwordHash;
+  });
+
+  remapUserIds(incoming, idMap);
+
+  const incomingIds = new Set((incoming.users || []).map((user) => user.id));
+  const removedIds = [...currentUserIds].filter((id) => !incomingIds.has(id));
+  for (const id of removedIds) {
+    const { error } = await supabaseAdmin.auth.admin.deleteUser(id);
+    if (error) console.error("Falha ao remover usuario do Supabase Auth", { id, message: error.message });
+  }
+}
+
+async function createSessionForUser(email, password) {
+  const { data, error } = await supabaseAuth.auth.signInWithPassword({ email, password });
+  if (error || !data?.session) throw new Error(error?.message || "Falha ao iniciar sessao apos cadastro.");
+  return data.session;
 }
 
 function publicUser(user) {
@@ -632,14 +663,14 @@ function generateSecureToken() {
 
 async function getPaymentTokenRecord(executor, token, options = {}) {
   const lockClause = options.lock ? " FOR UPDATE" : "";
-  const [[row]] = await executor.query(
+  const { rows } = await executor.query(
     `SELECT token, plan, duration_days, customer_email, transaction_id, status, used, used_by_user_id, used_at, created_at
      FROM payment_tokens
-     WHERE token = ?
+     WHERE token = $1
      LIMIT 1${lockClause}`,
     [token]
   );
-  return row || null;
+  return rows[0] || null;
 }
 
 function describePaymentTokenStatus(row) {
@@ -655,15 +686,11 @@ function inferPlanDetails(productName, recurrence) {
   if (recurrence === 90) return { plan: "trimestral", durationDays: 90 };
   if (recurrence === 365) return { plan: "anual", durationDays: 365 };
 
-  const text = String(productName || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  const text = String(productName || "").normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
   if (text.includes("anual")) return { plan: "anual", durationDays: 365 };
   if (text.includes("trimestral")) return { plan: "trimestral", durationDays: 90 };
   if (text.includes("mensal")) return { plan: "mensal", durationDays: 30 };
   return { plan: "mensal", durationDays: 30 };
-}
-
-function readPaymentTokenColumns() {
-  return pool.query("SHOW COLUMNS FROM payment_tokens").then(([rows]) => new Set(rows.map((row) => row.Field)));
 }
 
 function isApprovedCaktoEvent(payload, item) {
@@ -673,28 +700,13 @@ function isApprovedCaktoEvent(payload, item) {
   return eventName === "purchase_approved" || itemStatus === "paid" || subscriptionStatus === "active";
 }
 
-function firstFilledValue(source, paths) {
-  for (const pathName of paths) {
-    const value = valueAtPath(source, pathName);
-    if (value !== undefined && value !== null && String(value).trim() !== "") return value;
-  }
-  return "";
-}
-
-function valueAtPath(source, pathName) {
-  return String(pathName || "")
-    .split(".")
-    .filter(Boolean)
-    .reduce((current, key) => (current === undefined || current === null ? undefined : current[key]), source);
-}
-
-function buildAuthCookie(token) {
+function buildAuthCookie(token, maxAgeSeconds = 3600) {
   return serializeCookie(authCookieName, token, {
     httpOnly: true,
     secure: isProduction,
     sameSite: isProduction ? "None" : "Lax",
     path: "/",
-    maxAge: 8 * 60 * 60
+    maxAge: maxAgeSeconds
   });
 }
 
@@ -817,86 +829,34 @@ function pickKey(source, key) {
   return source?.[key] ? { [key]: source[key] } : {};
 }
 
+async function ensureRequiredAdmins() {
+  const admins = (seedState.users || []).filter((user) => user.role === "admin" && user.password);
+  for (const admin of admins) {
+    const authUserId = await ensureSupabaseUser(admin.email, admin.password);
+    await pool.query(
+      `INSERT INTO users (id, name, email, role, status, access_expires_at)
+       VALUES ($1, $2, $3, 'admin', 'active', NULL)
+       ON CONFLICT (id) DO UPDATE SET
+         name = EXCLUDED.name,
+         email = EXCLUDED.email,
+         role = EXCLUDED.role,
+         status = EXCLUDED.status,
+         access_expires_at = EXCLUDED.access_expires_at`,
+      [authUserId, admin.name, admin.email]
+    );
+  }
+}
+
 async function start() {
   if (process.env.AUTO_SEED === "true" && !(await hasUsers())) {
     console.log("AUTO_SEED ativo e tabela users vazia. Criando dados iniciais do Prisma Estudos...");
+    await provisionSeedState(seedState);
     await saveStateToDb(seedState);
   }
   await ensureRequiredAdmins();
-  await ensureStudyReviewsTable();
-  await ensureUserPreferencesTable();
   app.listen(port, () => {
     console.log(`Prisma Estudos API rodando na porta ${port}`);
   });
-}
-
-async function ensureStudyReviewsTable() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS study_reviews (
-        id               VARCHAR(40)  PRIMARY KEY,
-        user_id          VARCHAR(40)  NOT NULL,
-        title            VARCHAR(255) NOT NULL,
-        subject          VARCHAR(120),
-        topic            VARCHAR(180),
-        reviewed_at      DATE,
-        next_review_date DATE,
-        status           ENUM('pendente','concluida','encerrada') NOT NULL DEFAULT 'pendente',
-        difficulty       ENUM('facil','medio','dificil'),
-        notes            TEXT,
-        created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-        INDEX idx_sr_user_status      (user_id, status),
-        INDEX idx_sr_user_next_review (user_id, next_review_date)
-      )
-    `);
-    console.log("Tabela study_reviews verificada/criada.");
-  } catch (error) {
-    console.error("Erro ao criar tabela study_reviews:", error.message);
-  }
-}
-
-async function ensureUserPreferencesTable() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS user_preferences (
-        id                    VARCHAR(40)  PRIMARY KEY,
-        user_id               VARCHAR(40)  NOT NULL UNIQUE,
-        theme                 VARCHAR(20)  NOT NULL DEFAULT 'dark',
-        accent_color          VARCHAR(30)  NOT NULL DEFAULT 'blue',
-        study_goal            VARCHAR(255) NOT NULL DEFAULT '',
-        daily_study_minutes   INT          NOT NULL DEFAULT 60,
-        preferred_subjects    JSON,
-        notifications_enabled BOOLEAN      NOT NULL DEFAULT 1,
-        sound_enabled         BOOLEAN      NOT NULL DEFAULT 1,
-        layout_mode           VARCHAR(20)  NOT NULL DEFAULT 'default',
-        created_at            TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at            TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-      )
-    `);
-    console.log("Tabela user_preferences verificada/criada.");
-  } catch (error) {
-    console.error("Erro ao criar tabela user_preferences:", error.message);
-  }
-}
-
-async function ensureRequiredAdmins() {
-  const admins = (seedState.users || []).filter((user) => user.role === "admin" && user.passwordHash);
-  for (const admin of admins) {
-    await pool.query(
-      `INSERT INTO users (id, name, email, password_hash, role, status, access_expires_at)
-       VALUES (?, ?, ?, ?, 'admin', 'active', NULL)
-       ON DUPLICATE KEY UPDATE
-         name = VALUES(name),
-         password_hash = VALUES(password_hash),
-         role = VALUES(role),
-         status = VALUES(status),
-         access_expires_at = VALUES(access_expires_at)`,
-      [admin.id, admin.name, admin.email, admin.passwordHash]
-    );
-  }
 }
 
 if (require.main === module) {

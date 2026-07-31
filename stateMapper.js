@@ -27,7 +27,7 @@ function dateTimeFor(date) {
 }
 
 function bool(value) {
-  return value ? 1 : 0;
+  return Boolean(value);
 }
 
 module.exports = {
